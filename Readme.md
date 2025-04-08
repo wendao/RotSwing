@@ -1,4 +1,5 @@
-# PDB_Rotamers-v3
+# RotSwing
+A protein modeling and sampling method for non canonical amino acids, post-translational modifications, and covalent modifications
 
 ## Dependence
 This script is tested under Python 3.8.18.
@@ -28,7 +29,7 @@ In order to generate Rosetta and Gromacs parameters, you can refer to the follow
 3. Enter the following command to run the script
 ```
 cd ~/YOUR_NCAA_FOLDER
-python Param_Rotamer-v3.py -i input.smiles -n UAA
+python Param_Rotamer.py -i input.smiles -n UAA
 ```
 Required:
 -i: your NCAA's SMILES
