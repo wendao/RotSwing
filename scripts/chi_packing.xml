@@ -1,0 +1,71 @@
+<ROSETTASCRIPTS>
+    <SCOREFXNS>
+        <!-- Soft score function -->
+        <ScoreFunction name="soft_r15" weights="ref2015_soft">
+        </ScoreFunction>
+        <!-- Hard score function -->
+        <ScoreFunction name="hard_r15" weights="ref2015">
+        </ScoreFunction>
+    </SCOREFXNS>
+
+    <RESIDUE_SELECTORS>
+        <Index name="mutant" resnums="%%resnum%%"/>
+        <Neighborhood name="shell" selector="mutant" distance="6.0"/>
+        <Not name="notshell" selector="shell"/>
+    </RESIDUE_SELECTORS>
+
+    <TASKOPERATIONS>
+        <InitializeFromCommandline name="init"/>
+        <OperateOnResidueSubset name="prevent_repack" selector="notshell">
+            <PreventRepackingRLT />
+        </OperateOnResidueSubset>
+        <OperateOnResidueSubset name="allow_repack" selector="shell">
+            <RestrictToRepackingRLT />
+        </OperateOnResidueSubset>
+        <OperateOnResidueSubset name="extra_chi_repack" selector="shell">
+            <ExtraRotamersGenericRLT ex1="1" ex2="1" ex1_sample_level="1" ex2_sample_level="1" />
+        </OperateOnResidueSubset>
+    </TASKOPERATIONS>
+
+    <MOVERS>
+        <MutateResidue name="mutate" residue_selector="mutant" new_res="%%new_ncaa%%"/> 
+        
+        <!-- Soft repack and minimize -->
+        <PackRotamersMover name="soft_repack" scorefxn="soft_r15" task_operations="init,prevent_repack,allow_repack,extra_chi_repack"/>
+        <MinMover name="soft_min" scorefxn="soft_r15" chi="1" bb="0" jump="0"/>
+        
+        <!-- Hard minimize and repack -->
+        <MinMover name="hard_min" scorefxn="hard_r15" chi="1" bb="0" jump="0"/>
+        <PackRotamersMover name="hard_repack" scorefxn="hard_r15" task_operations="init,prevent_repack,allow_repack,extra_chi_repack"/>
+
+        <!-- RTmin for final optimization -->
+        <RotamerTrialsMinMover name="RTmin" scorefxn="hard_r15" task_operations="init,prevent_repack,allow_repack,extra_chi_repack"/>
+		
+        <!-- Define the sequence of operations in one iteration -->
+        <ParsedProtocol name="iteration">
+            <Add mover_name="soft_repack"/>
+            <Add mover_name="soft_min"/>
+
+            <Add mover_name="soft_repack"/>
+            <Add mover_name="hard_min"/>
+
+            <Add mover_name="hard_repack"/>
+            <Add mover_name="hard_min"/>
+
+            <Add mover_name="hard_repack"/>
+			<Add mover_name="RTmin"/>
+            <Add mover_name="hard_min"/>
+        </ParsedProtocol>
+        
+        <!-- Perform 4 iterations -->
+        <LoopOver name="4_iterations" mover_name="iteration" iterations="4"/>
+    </MOVERS>
+
+    <PROTOCOLS>
+        <!-- Mutate and then perform 4 iterations of the refinement process -->
+        <Add mover="mutate"/>
+        <Add mover="4_iterations"/>
+    </PROTOCOLS>
+
+    <OUTPUT scorefxn="hard_r15"/>
+</ROSETTASCRIPTS>
