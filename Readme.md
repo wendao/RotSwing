@@ -16,6 +16,11 @@ Other software and libraries that need to be installed:
 - dftd4 3.6.0
 - dftd4-python 3.6.0
 
+    conda install cudatoolkit=11.3 cudnn
+    pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113
+    conda install conda-forge::openbabel
+    conda install ambertools=22 acpype dftd4
+
 ## Input
 An **input.smiles** file which contains SMILES format test of your molecule is required, the content is similar to the following form:
 
