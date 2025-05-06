@@ -26,7 +26,7 @@ AIMNet库解析：
 3. load_AIMNetSMD_ens
    溶剂模型，此处采用的是一种通用溶剂，没有特定的溶剂类型
 '''
-sys.path.append('/home/rotations/Leon/AIMNet/aimnet-master')
+sys.path.append('/home/wendao/work/peprobe/aimnet/')
 from aimnet import load_AIMNetMT_ens, load_AIMNetSMD_ens, AIMNetCalculator
 import ase
 import ase.optimize
@@ -37,7 +37,6 @@ from ase.calculators.calculator import Calculator
 from ase.optimize import BFGS
 from ase.constraints import FixInternals
 import ase.io
-#from dftd4.ase import DFTD4
 import tempfile
 from rdkit.Chem import SDMolSupplier, MolFromMolBlock
 from rdkit.Chem import rdmolfiles
@@ -121,7 +120,7 @@ def print_dihedral_angle(mol, atom_indices):
     try:
         conf = mol.GetConformer()  # 获取分子的Conformer对象
         angle = get_dihedral_angle(conf, atom_indices)
-        print(f"Dihedral angle for atoms {atom_indices}: {angle} degrees")
+        print(f"Dihedral angle for atoms {atom_indices}: {angle:.2f} degrees")
     except Exception as e:
         print(f"Error getting dihedral angle for atoms {atom_indices}: {e}")
 
@@ -220,7 +219,7 @@ def optimize_molecule(smiles, name):
     set_dihedral_angle(mol, [3, 4, 5, 7], 150.0)
     set_dihedral_angle(mol, [2, 1, 3, 4], 4.18)
     set_dihedral_angle(mol, [6, 5, 7, 8], 1.17)
-        
+
     # 使用UFF力场进行结构优化
     '''初步优化分子结构，防止其因为结构过于糟糕导致AIMNet优化报错'''
     ff = UFFGetMoleculeForceField(mol)
@@ -272,9 +271,9 @@ def optimize_molecule(smiles, name):
     
     # 从气相结果中提取电荷分布信息以及体积信息
     charges = calc_gas.results['elmoments'][0, :, 0]
-#    print('Charges: ', charges)
+    print('Charges: ', charges)
     volumes = calc_gas.results['volume'][0]
-#    print('Volumes: ', volumes)
+    print('Volumes: ', volumes)
     
     # 将电荷与原子名称写入 charge.txt 文件
     '''该charge文件在后续并没有被实际应用，最初的想法是用这里产生的charge电荷直接替换params的初始电荷，以省去RESP拟合步骤，但最终发现该电荷数值存在较大问题，遂放弃。'''
@@ -514,7 +513,9 @@ def molfile_to_params(mol_filepath, name):
     
     # 通过命令行调用molfile_to_params_polymer.py脚本，执行参数化
     # 实际使用中需要根据当前操作环境下的脚本路径对以下命令进行修改
-    command = f"python2 /home/fzwang/rosetta_bin_linux_2020.25.61318_bundle/main/demos/public/using_ncaas_protein_peptide_interface_design/HowToMakeResidueTypeParamFiles/scripts/molfile_to_params_polymer.py -n {name} --polymer {mol_filepath}"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    command = f"python2 {script_dir}/molfile_to_params_polymer_modify.py -n {name} --polymer {mol_filepath}"
+    print(command)
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     
     # 检查任务是否正确运行
@@ -538,7 +539,8 @@ def molfile_to_params_temps(mol_filepath, name):
         return
     
     # 使用molfile_to_params_polymer_modify.py脚本进行参数化
-    command = f"python2 /home/fzwang/rosetta_bin_linux_2020.25.61318_bundle/main/demos/public/using_ncaas_protein_peptide_interface_design/HowToMakeResidueTypeParamFiles/scripts/molfile_to_params_polymer_modify.py -n {name}_temps --no_reorder --polymer {mol_filepath}"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    command = f"python2 {script_dir}/molfile_to_params_polymer_modify.py -n {name}_temps --no_reorder --polymer {mol_filepath}"
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     
     # 检查任务是否被顺利运行
@@ -595,8 +597,7 @@ def generate_opt(pdb_file, resp,resp_folder, system_charge):
     modify_gjf_file(resp_folder, system_charge)
     
     # 运行 Gaussian 计算并将输出转换为 mol2 文件
-    #os.system(f'/home/rotations/Leon/g16/g16/g16 {resp}.gjf && antechamber -i {resp}.log -fi gout -o {resp}.mol2 -fo mol2 -at amber -pf y -c resp')
-    os.system(f'/home/wendao/install/g16/g16/g16 {resp}.gjf && antechamber -i {resp}.log -fi gout -o {resp}.mol2 -fo mol2 -at amber -pf y -c resp')
+    os.system(f'/home/wendao/install/g16/g16 {resp}.gjf && antechamber -i {resp}.log -fi gout -o {resp}.mol2 -fo mol2 -at amber -pf y -c resp')
     print(f'\nThe optimized structure with RESP charge has been output to {resp}.mol2 and needs to be further processed!!\n')
 
 # 使用RESP电荷替换params文件的原始电荷
@@ -1086,7 +1087,7 @@ def generate_top(resp_folder):
             # 生成leapin文件
             leapin_filename = f'{res}_leap.in'
             with open(leapin_filename, 'w+') as leapin:
-                leapin.write(f'source /home/rotations/.conda/envs/rdkit/dat/leap/cmd/leaprc.protein.ff19SB\n')
+                leapin.write(f'source /home/wendao/micromamba/envs/peprobe/dat/leap/cmd/leaprc.protein.ff19SB\n')
                 leapin.write(f'loadamberparams {mod_file}\n')
                 leapin.write(f'mol=loadmol2 {os.path.join(resp_folder, mol2_file)}\n')
                 leapin.write(f'check mol\n')
