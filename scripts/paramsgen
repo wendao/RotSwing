@@ -1,0 +1,1001 @@
+#!/usr/bin/env python3
+"""
+paramsgen - Generate Rosetta parameter files (.params)
+
+Phase 2 of NCAA parameterization pipeline.
+Generates .params files from intermediate MOL/MOL2 files for use in Rosetta.
+Includes rotamer library generation and charge refinement.
+
+Usage:
+    paramsgen -n XXX [-r RMSD_THRESHOLD]
+
+Input:
+    - mol/XXX_opt.mol       : MOL file from prepff
+    - RESP/XXX_1.mol2       : MOL2 file with RESP charges from prepff
+
+Output:
+    - XXX.params            : Rosetta parameter file
+    - XXX_temps.params      : Temporary params file (for charge transfer)
+    - merged_combined_pdb_files.pdb : Rotamer library PDB
+"""
+
+import os
+import argparse
+import re
+import numpy as np
+import subprocess
+import math
+from Bio import PDB
+from Bio.PDB import PDBParser, PDBIO, Superimposer
+
+
+# ============================================================================
+# Rosetta Params Generation
+# ============================================================================
+
+def molfile_to_params(mol_filepath, name):
+    """Convert MOL file to Rosetta params file using molfile_to_params_polymer.py."""
+    base_name = os.path.splitext(os.path.basename(mol_filepath))[0]
+    params_filename = f"{base_name}.params"
+    params_filepath = os.path.join(os.getcwd(), params_filename)
+
+    if os.path.exists(params_filepath):
+        print(f"Params file {params_filepath} already exists. Skipping.")
+        return
+
+    # Path to Rosetta script (adjust as needed)
+    rosetta_script = ("/home/fzwang/rosetta_bin_linux_2020.25.61318_bundle/main/demos/"
+                      "public/using_ncaas_protein_peptide_interface_design/"
+                      "HowToMakeResidueTypeParamFiles/scripts/molfile_to_params_polymer.py")
+
+    command = f"python2 {rosetta_script} -n {name} --polymer {mol_filepath}"
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Error converting {mol_filepath}:\n{result.stdout}\n{result.stderr}")
+        return
+
+    print(f"Converted {mol_filepath} to {params_filepath}")
+
+
+def molfile_to_params_temps(mol_filepath, name):
+    """Generate temporary params file with --no_reorder flag."""
+    base_name = os.path.splitext(os.path.basename(mol_filepath))[0]
+    params_filename = f"{base_name}_temps.params"
+    params_filepath = os.path.join(os.getcwd(), params_filename)
+
+    if os.path.exists(params_filepath):
+        print(f"Params file {params_filepath} already exists. Skipping.")
+        return
+
+    rosetta_script = ("/home/fzwang/rosetta_bin_linux_2020.25.61318_bundle/main/demos/"
+                      "public/using_ncaas_protein_peptide_interface_design/"
+                      "HowToMakeResidueTypeParamFiles/scripts/molfile_to_params_polymer_modify.py")
+
+    command = f"python2 {rosetta_script} -n {name}_temps --no_reorder --polymer {mol_filepath}"
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Error converting {mol_filepath}:\n{result.stdout}\n{result.stderr}")
+        return
+
+    print(f"Converted {mol_filepath} to {params_filepath}")
+
+
+# ============================================================================
+# ICOOR Parameter Processing
+# ============================================================================
+
+def calculate_dihedral_params(coords1, coords2, coords3, coords4):
+    """Calculate dihedral angle from 4 sets of coordinates."""
+    def vector_subtract(a, b):
+        return [a[i] - b[i] for i in range(3)]
+
+    def vector_dot(a, b):
+        return sum(a[i] * b[i] for i in range(3))
+
+    def vector_cross(a, b):
+        return [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]
+        ]
+
+    def vector_magnitude(v):
+        return math.sqrt(sum(x**2 for x in v))
+
+    def vector_normalize(v):
+        mag = vector_magnitude(v)
+        return [x / mag for x in v]
+
+    p, q, r, s = coords1, coords2, coords3, coords4
+
+    pq = vector_subtract(q, p)
+    qr = vector_subtract(r, q)
+    rs = vector_subtract(s, r)
+
+    pq_cross_qr = vector_cross(pq, qr)
+    qr_cross_rs = vector_cross(qr, rs)
+
+    pq_cross_qr_mag = vector_magnitude(pq_cross_qr)
+    qr_cross_rs_mag = vector_magnitude(qr_cross_rs)
+
+    pq_cross_qr_dot_qr_cross_rs = vector_dot(pq_cross_qr, qr_cross_rs)
+    cos_dihedral = pq_cross_qr_dot_qr_cross_rs / (pq_cross_qr_mag * qr_cross_rs_mag)
+
+    qr_normalized = vector_normalize(qr)
+    pq_cross_qr_cross_qr = vector_cross(pq_cross_qr, qr_normalized)
+    sin_dihedral = vector_dot(pq_cross_qr_cross_qr, qr_cross_rs) / (pq_cross_qr_mag * qr_cross_rs_mag)
+
+    return math.degrees(math.atan2(sin_dihedral, cos_dihedral))
+
+
+def calculate_angle_params(coords1, coords2, coords3):
+    """Calculate bond angle from 3 sets of coordinates."""
+    ba = [coords1[i] - coords2[i] for i in range(3)]
+    bc = [coords3[i] - coords2[i] for i in range(3)]
+
+    ba_dot_bc = sum(ba[i] * bc[i] for i in range(3))
+    ba_mag = math.sqrt(sum(ba[i]**2 for i in range(3)))
+    bc_mag = math.sqrt(sum(bc[i]**2 for i in range(3)))
+
+    cos_angle = ba_dot_bc / (ba_mag * bc_mag)
+    return math.degrees(math.acos(cos_angle))
+
+
+def process_params_file(n_value, resp_folder='RESP'):
+    """Update ICOOR parameters in params file from MOL2 coordinates."""
+    filename = f'{n_value}.params'
+
+    # Convert MOL2 to PDB for coordinate extraction
+    mol2_file = f'{resp_folder}/{n_value}_1.mol2'
+    pdb_file = f'{resp_folder}/{n_value}_1.pdb'
+    os.system(f'obabel {mol2_file} -O {pdb_file}')
+
+    # Extract atom coordinates
+    atom_coords = {}
+    with open(pdb_file, 'r') as file:
+        for line in file:
+            if line.startswith("ATOM"):
+                parts = line.split()
+                atom_name = parts[2]
+                coords = [float(parts[6]), float(parts[7]), float(parts[8])]
+                atom_coords[atom_name] = coords
+
+    # Calculate required ICOOR values
+    value_1 = calculate_dihedral_params(atom_coords['O'], atom_coords['C'],
+                                        atom_coords['CA'], atom_coords['N1'])
+    value_2 = 180 - calculate_angle_params(atom_coords['O'], atom_coords['C'],
+                                           atom_coords['CA'])
+    value_3 = math.sqrt(sum([(atom_coords['O'][i] - atom_coords['C'][i])**2
+                             for i in range(3)]))
+
+    value_4 = calculate_dihedral_params(atom_coords['CB'], atom_coords['CA'],
+                                        atom_coords['N'], atom_coords['C'])
+    value_5 = 180 - calculate_angle_params(atom_coords['CB'], atom_coords['CA'],
+                                           atom_coords['N'])
+    value_6 = math.sqrt(sum([(atom_coords['CB'][i] - atom_coords['CA'][i])**2
+                             for i in range(3)]))
+
+    # Update params file
+    with open(filename, 'r') as file:
+        lines = file.readlines()
+
+    # Update O ICOOR
+    for i, line in enumerate(lines):
+        if line.startswith('ICOOR_INTERNAL    O '):
+            parts = line.split()
+            if len(parts) == 8:
+                dihedral_angle = float(parts[2])
+                bond_angle = float(parts[3])
+
+                if not (179 <= dihedral_angle <= 181 or -181 <= dihedral_angle <= -179) or \
+                   not (59 <= bond_angle <= 61):
+                    new_line = (f'ICOOR_INTERNAL    O    {value_1:.6f}   '
+                               f'{value_2:.6f}    {value_3:.6f}   C     CA  UPPER\n')
+                    lines[i] = new_line
+                    break
+
+    # Update CB ICOOR
+    for i, line in enumerate(lines):
+        if line.startswith('ICOOR_INTERNAL    CB'):
+            parts = line.split()
+            if len(parts) == 8:
+                dihedral_angle = float(parts[2])
+                bond_angle = float(parts[3])
+
+                if not (-123 <= dihedral_angle <= -121 or 121 <= dihedral_angle <= 123) or \
+                   not (69 <= bond_angle <= 71):
+                    new_line = (f'ICOOR_INTERNAL    CB  -{value_4:.6f}   '
+                               f'{value_5:.6f}    {value_6:.6f}   CA    N     C \n')
+                    lines[i] = new_line
+                    break
+
+    with open(filename, 'w') as file:
+        file.writelines(lines)
+
+    print(f"Updated ICOOR parameters in {filename}")
+
+
+# ============================================================================
+# Charge Processing
+# ============================================================================
+
+def read_mol2_file(mol2_filepath):
+    """Read atom lines from MOL2 file (skip ACE/NME caps)."""
+    atom_lines = []
+    with open(mol2_filepath, 'r') as f:
+        lines = f.readlines()
+
+    atom_started = False
+    for line in lines:
+        if line.startswith('@<TRIPOS>ATOM'):
+            atom_started = True
+            continue
+        if line.startswith('@<TRIPOS>BOND'):
+            atom_started = False
+            continue
+        if atom_started and line.strip():
+            atom_lines.append(line.strip())
+
+    return atom_lines[12:]  # Skip first 12 atoms (ACE + NME caps)
+
+
+def read_params_file(params_filepath):
+    """Read ATOM lines from params file."""
+    atom_lines = []
+    with open(params_filepath, 'r') as f:
+        for line in f:
+            if line.startswith('ATOM'):
+                atom_lines.append(line.strip())
+    return atom_lines
+
+
+def adjust_charges_to_integer(charges_list, system_charge):
+    """Adjust charges to ensure they sum to integer value."""
+    rounded_charges = [round(charge, 2) for charge in charges_list]
+    charge_diff = system_charge - sum(rounded_charges)
+
+    if charge_diff == 0:
+        return rounded_charges
+
+    # Sort by absolute charge value (largest first)
+    sorted_indices = sorted(range(len(charges_list)),
+                           key=lambda i: abs(charges_list[i]), reverse=True)
+
+    # Adjust charges by 0.01
+    for _ in range(abs(int(charge_diff * 100))):
+        for i in sorted_indices:
+            if charge_diff > 0:
+                rounded_charges[i] += 0.01
+                charge_diff -= 0.01
+            elif charge_diff < 0:
+                rounded_charges[i] -= 0.01
+                charge_diff += 0.01
+            if round(charge_diff, 2) == 0:
+                break
+
+    return rounded_charges
+
+
+def modify_params_file(params_filepath, rounded_charges):
+    """Update charges in params file."""
+    with open(params_filepath, 'r') as f:
+        lines = f.readlines()
+
+    atom_indices = []
+    for idx, line in enumerate(lines):
+        if line.startswith('ATOM'):
+            atom_indices.append(idx)
+
+    if len(atom_indices) != len(rounded_charges):
+        raise ValueError('ATOM lines count does not match charges list length')
+
+    for i, idx in enumerate(atom_indices):
+        original_line = lines[idx]
+        new_charge = f"{rounded_charges[i]:.2f}"
+        if float(new_charge) > 0:
+            new_charge = f" {new_charge}"
+
+        new_line = original_line[:-5] + new_charge + '\n'
+        lines[idx] = new_line
+
+    with open(params_filepath, 'w') as f:
+        f.writelines(lines)
+
+    print(f"Updated charges in {params_filepath}")
+
+
+def update_params_file_with_temps(params_filepath, temps_filepath):
+    """Copy atom data from temps params to main params file."""
+    with open(params_filepath, 'r') as f:
+        params_lines = f.readlines()
+
+    temps_atoms = []
+    with open(temps_filepath, 'r') as f:
+        for line in f:
+            if line.startswith('ATOM'):
+                temps_atoms.append(line.strip())
+
+    updated_lines = []
+    for line in params_lines:
+        if line.startswith('ATOM'):
+            atom_id = line[:18]
+            for temps_line in temps_atoms:
+                if temps_line[:18] == atom_id:
+                    line = temps_line + '\n'
+                    break
+        updated_lines.append(line)
+
+    with open(params_filepath, 'w') as f:
+        f.writelines(updated_lines)
+
+    print(f"Updated {params_filepath} with data from {temps_filepath}")
+
+
+def process_charges(n_value, resp_folder='RESP'):
+    """Process and adjust charges from MOL2 to params file."""
+    mol2_filepath = os.path.join(resp_folder, f'{n_value}_1.mol2')
+    temps_params = f'{n_value}_temps.params'
+
+    # Calculate system charge
+    # (Assuming neutral system, modify if needed)
+    system_charge = 0
+
+    # Read MOL2 charges
+    atom_lines = read_mol2_file(mol2_filepath)
+    charges_list = [float(line.split()[-1]) for line in atom_lines]
+
+    # Adjust to integer
+    rounded_charges = adjust_charges_to_integer(charges_list, system_charge)
+    print(f"Charges after adjustment: {rounded_charges}")
+
+    # Update temps params
+    modify_params_file(temps_params, rounded_charges)
+
+    # Copy to main params
+    main_params = f'{n_value}.params'
+    update_params_file_with_temps(main_params, temps_params)
+
+
+# ============================================================================
+# RMSD Screening and Rotamer Generation
+# ============================================================================
+
+BACKBONE_ATOMS = {'C3', 'C4', 'O1', 'N1', 'O2'}
+
+
+def get_backbone_atoms(structure):
+    """Get backbone atoms for alignment."""
+    return [atom for atom in structure.get_atoms() if atom.get_name() in BACKBONE_ATOMS]
+
+
+def kabsch_algorithm(P, Q):
+    """Calculate optimal rotation matrix using Kabsch algorithm."""
+    P_centered = P - np.mean(P, axis=0)
+    Q_centered = Q - np.mean(Q, axis=0)
+
+    H = np.dot(P_centered.T, Q_centered)
+    U, S, Vt = np.linalg.svd(H)
+    V = Vt.T
+    d = np.sign(np.linalg.det(np.dot(V, U.T)))
+
+    return np.dot(V, np.dot(np.diag([1, 1, d]), U.T))
+
+
+def calculate_rmsd(P, Q):
+    """Calculate RMSD between two point sets."""
+    P_centered = P - np.mean(P, axis=0)
+    Q_centered = Q - np.mean(Q, axis=0)
+
+    R = kabsch_algorithm(P_centered, Q_centered)
+    P_rot = np.dot(P_centered, R)
+
+    diff = P_rot - Q_centered
+    return np.sqrt(np.mean(np.sum(diff**2, axis=1)))
+
+
+def get_coordinates(structure, atoms_to_exclude):
+    """Extract coordinates excluding specified atoms."""
+    coords = []
+    for atom in structure.get_atoms():
+        if atom.get_name() not in atoms_to_exclude and 'H' not in atom.get_name():
+            coords.append(atom.get_coord())
+    return np.array(coords)
+
+
+def align_and_calculate_rmsd(ref_structure, temp_structure):
+    """Calculate RMSD between two structures (excluding caps and backbone)."""
+    atoms_to_exclude = {'C1', 'C2', 'C4', 'C5', 'O1', 'O2', 'N1', 'N2'}
+
+    coords1 = get_coordinates(ref_structure, atoms_to_exclude)
+    coords2 = get_coordinates(temp_structure, atoms_to_exclude)
+
+    if coords1.shape != coords2.shape:
+        raise ValueError("Coordinate shape mismatch between PDB files")
+
+    return calculate_rmsd(coords1, coords2)
+
+
+def align_structures_and_check_rmsd(pdb_files, parser, output_file, rmsd_threshold, v_value):
+    """Align structures and filter by RMSD."""
+    aligned_structures = []
+    conformer_count = 0
+
+    with open(output_file, 'w') as out_f, open('prechi_structure.pdb', 'w') as prechi_f:
+        ref_structure = parser.get_structure('reference', pdb_files[0])
+        aligned_structures.append(ref_structure)
+
+        for pdb_file in pdb_files[1:]:
+            temp_structure = parser.get_structure('temp', pdb_file)
+
+            # Write to prechi file
+            with open(pdb_file, 'r') as f:
+                for line in f:
+                    if line.startswith(('REMARK', 'ATOM', 'HETATM', 'END')):
+                        prechi_f.write(line)
+
+            if conformer_count >= v_value:
+                continue
+
+            # Check RMSD against all aligned structures
+            should_keep = True
+            for aligned_structure in reversed(aligned_structures):
+                rmsd = align_and_calculate_rmsd(aligned_structure, temp_structure)
+                print(f"RMSD: {rmsd:.4f}")
+                if rmsd < rmsd_threshold:
+                    should_keep = False
+                    break
+
+            if should_keep:
+                with open(pdb_file, 'r') as f:
+                    for line in f:
+                        if line.startswith(('REMARK', 'ATOM', 'HETATM', 'END')):
+                            out_f.write(line)
+                conformer_count += 1
+                aligned_structures.append(temp_structure)
+
+    print(f"Number of conformers passing RMSD filter: {conformer_count}")
+
+
+def screen_rmsd(rmsd_threshold, v_value):
+    """Screen conformers by RMSD."""
+    parser = PDBParser(QUIET=True)
+
+    # Read combined PDB
+    with open('combined_sorted_pdb_files.pdb', 'r') as f:
+        content = f.read().strip().split('END\n')
+
+    # Split into individual files
+    pdb_files = []
+    for i, pdb_content in enumerate(content):
+        if pdb_content.strip():
+            pdb_filename = f'pdb_{i}.pdb'
+            with open(pdb_filename, 'w') as f:
+                f.write(pdb_content + 'END\n')
+            pdb_files.append(pdb_filename)
+
+    # Align and filter
+    align_structures_and_check_rmsd(pdb_files, parser,
+                                    'aligned_combined_pdb_files.pdb',
+                                    rmsd_threshold, v_value)
+
+    # Cleanup
+    for pdb_file in pdb_files:
+        os.remove(pdb_file)
+
+
+# ============================================================================
+# Chi Angle Screening
+# ============================================================================
+
+def parse_params_file_chi(file_path):
+    """Parse CHI definitions from params file."""
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
+    atom_lines = [line for line in lines if line.startswith("ATOM")]
+    chi_lines = [line[5:].strip() for line in lines if line.startswith("CHI")]
+    chi_lines = [line for line in chi_lines if 'H' not in line]
+
+    return atom_lines, chi_lines
+
+
+def create_atom_mapping(list1, list2):
+    """Create mapping between PDB and params atom names."""
+    atom_mapping = {}
+    for atom1, atom2 in zip(list1, list2):
+        key = atom1[12:17].strip()
+        value = atom2[4:9].strip()
+        atom_mapping[key] = value
+    return atom_mapping
+
+
+def replace_chi_atoms(chi_lines, atom_mapping):
+    """Replace params atom names with PDB atom names in CHI definitions."""
+    reversed_mapping = {v: k for k, v in atom_mapping.items()}
+    replaced_chi_lines = []
+
+    for chi_line in chi_lines:
+        atoms = chi_line.split()
+        replaced_atoms = []
+        for atom in atoms:
+            if atom.strip() in reversed_mapping:
+                replaced_atoms.append(reversed_mapping[atom.strip()])
+            else:
+                replaced_atoms.append(atom.strip())
+        replaced_chi_lines.append(' '.join(replaced_atoms))
+
+    return replaced_chi_lines
+
+
+def calculate_dihedral(coords1, coords2, coords3, coords4):
+    """Calculate dihedral angle between 4 points."""
+    b1 = coords2 - coords1
+    b2 = coords3 - coords2
+    b3 = coords4 - coords3
+
+    b2 /= np.linalg.norm(b2)
+
+    v = b1 - np.dot(b1, b2) * b2
+    w = b3 - np.dot(b3, b2) * b2
+
+    x = np.dot(v, w)
+    y = np.dot(np.cross(b2, v), w)
+
+    angle = np.degrees(np.arctan2(y, x))
+
+    if angle < 0:
+        angle += 360
+    if angle > 180:
+        angle = 360 - angle
+
+    return angle
+
+
+def find_atom_coordinates(pdb_block, atom_name):
+    """Find atom coordinates in PDB block."""
+    for line in pdb_block:
+        if line[12:17].strip() == atom_name:
+            x = float(line[30:38].strip())
+            y = float(line[38:46].strip())
+            z = float(line[46:54].strip())
+            return np.array([x, y, z])
+    return None
+
+
+def calculate_all_dihedrals(pdb_block, chi_lines, atom_mapping):
+    """Calculate all chi angles for a PDB block."""
+    dihedral_angles = []
+    for chi_line in chi_lines:
+        atoms = chi_line.split()
+        coords = [find_atom_coordinates(pdb_block, atom) for atom in atoms]
+        coords = [c for c in coords if c is not None]
+        if len(coords) == 4:
+            angle = calculate_dihedral(*coords)
+            dihedral_angles.append(angle)
+    return dihedral_angles
+
+
+def compare_dihedrals(reference_angles, pdb_angles, threshold=15):
+    """Compare dihedral angles, return True if different enough."""
+    for ref_angle, pdb_angle in zip(reference_angles, pdb_angles):
+        diff = abs(ref_angle - pdb_angle)
+        if diff >= threshold:
+            return True
+    return False
+
+
+def chi_screen(args_params, output_file='Chi_screen.pdb'):
+    """Screen conformers by chi angle diversity."""
+    combined_file = 'prechi_structure.pdb'
+
+    # Clear output file
+    open(output_file, 'w').close()
+
+    # Read and preprocess PDB
+    with open(combined_file, 'r') as f:
+        lines = f.readlines()
+
+    lines = [line for line in lines if line.startswith(("HETATM", "ATOM  ", "END"))]
+
+    # Split into blocks
+    pdb_blocks = []
+    block = []
+    for line in lines:
+        if line.strip() == "END":
+            block.append(line)
+            pdb_blocks.append(block)
+            block = []
+        else:
+            block.append(line)
+
+    if block:
+        pdb_blocks.append(block)
+
+    # Parse params for CHI definitions
+    atom_lines, chi_lines = parse_params_file_chi(args_params)
+
+    # Keep first conformer
+    with open(output_file, 'w') as f:
+        f.writelines(pdb_blocks[0])
+
+    kept_blocks = [pdb_blocks[0]]
+    kept_count = 1
+
+    # Screen remaining conformers
+    for i, pdb_block in enumerate(pdb_blocks[1:], 1):
+        atom_lines_in_pdb = [line for line in pdb_block
+                            if line.startswith("HETATM") or line.startswith("ATOM")]
+        atom_mapping = create_atom_mapping(atom_lines_in_pdb, atom_lines)
+        replaced_chi_lines = replace_chi_atoms(chi_lines, atom_mapping)
+
+        reference_angles = calculate_all_dihedrals(pdb_block, replaced_chi_lines, atom_mapping)
+
+        should_keep = True
+        for kept_block in reversed(kept_blocks):
+            kept_angles = calculate_all_dihedrals(kept_block, replaced_chi_lines, atom_mapping)
+            if not compare_dihedrals(reference_angles, kept_angles):
+                should_keep = False
+                break
+
+        if should_keep:
+            kept_count += 1
+            with open(output_file, 'a') as f:
+                f.writelines(pdb_block)
+            kept_blocks.append(pdb_block)
+            print(f"Keep conformer {i}")
+
+    print(f"Conformers passing CHI filter: {kept_count}")
+
+
+# ============================================================================
+# PDB Processing for Rotamer Library
+# ============================================================================
+
+def remove_ace_nme(lines):
+    """Remove ACE and NME cap lines from PDB."""
+    return [line for line in lines if "ACE" not in line and "NME" not in line]
+
+
+def split_pdb_by_end(lines):
+    """Split PDB into blocks separated by END."""
+    blocks = []
+    block = []
+    for line in lines:
+        if line.strip() == "END":
+            block.append(line)
+            blocks.append(block)
+            block = []
+        else:
+            block.append(line)
+    if block:
+        blocks.append(block)
+    return blocks
+
+
+def extract_conformers(lines):
+    """Extract conformer blocks from PDB."""
+    blocks = []
+    block = []
+    for line in lines:
+        if line.strip() == "END":
+            block.append(line)
+            blocks.append(''.join(block))
+            block = []
+        else:
+            block.append(line)
+    if block:
+        blocks.append(''.join(block))
+    return blocks
+
+
+def pdb_to_structure(pdb_data):
+    """Parse PDB data to BioPython structure."""
+    from io import StringIO
+    parser = PDB.PDBParser(QUIET=True)
+    pdb_io = StringIO(pdb_data)
+    return parser.get_structure('structure', pdb_io)
+
+
+def calculate_chi_aligned_rmsd(ref_structure, temp_structure):
+    """Calculate RMSD for chi-aligned structures."""
+    atoms_to_exclude = {'C1', 'C2', 'C4', 'C5', 'O1', 'O2', 'N1', 'N2'}
+
+    coords1 = get_coordinates(ref_structure, atoms_to_exclude)
+    coords2 = get_coordinates(temp_structure, atoms_to_exclude)
+
+    if coords1.shape != coords2.shape:
+        raise ValueError("Coordinate shape mismatch")
+
+    return calculate_rmsd(coords1, coords2)
+
+
+def append_unique_conformers(chi_screen_path, aligned_combined_path, rmsd_cutoff=0.005):
+    """Append unique conformers from chi screening to aligned combined file."""
+    with open(chi_screen_path, 'r') as f:
+        chi_lines = f.readlines()
+    with open(aligned_combined_path, 'r') as f:
+        aligned_lines = f.readlines()
+
+    chi_blocks = extract_conformers(chi_lines)
+    aligned_blocks = extract_conformers(aligned_lines)
+
+    new_conformers = []
+    new_count = 0
+
+    for chi_block in chi_blocks:
+        chi_structure = pdb_to_structure(chi_block)
+
+        is_unique = True
+        for aligned_block in aligned_blocks:
+            aligned_structure = pdb_to_structure(aligned_block)
+            rmsd = calculate_chi_aligned_rmsd(chi_structure, aligned_structure)
+
+            if rmsd <= rmsd_cutoff:
+                is_unique = False
+                break
+
+        if is_unique:
+            new_conformers.append(chi_block)
+            new_count += 1
+
+    if new_conformers:
+        with open(aligned_combined_path, 'a') as f:
+            f.writelines(new_conformers)
+
+    print(f"New conformers added: {new_count}")
+
+
+def remove_ace_nme_lines(pdb_filename):
+    """Remove ACE/NME lines and renumber atoms."""
+    lines = []
+    current_number = 1
+
+    with open(pdb_filename, 'r') as f:
+        for line in f:
+            if 'ACE' in line or 'NME' in line:
+                continue
+            if line.startswith('ATOM'):
+                line = f"{line[:6]}{current_number:>4}{line[10:]}"
+                current_number += 1
+            lines.append(line)
+
+    with open(pdb_filename, 'w') as f:
+        f.write(''.join(lines))
+
+
+def split_pdb_file(input_pdb_file, output_dir='split_pdbs'):
+    """Split PDB file into individual conformers."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    conformation_index = 1
+    pdb_content = []
+
+    with open(input_pdb_file, 'r') as f:
+        for line in f:
+            if line.strip() == 'END':
+                pdb_filename = os.path.join(output_dir, f'conformation_{conformation_index}.pdb')
+                with open(pdb_filename, 'w') as pdb_file:
+                    pdb_file.write('\n'.join(pdb_content) + '\nENDMDL\n')
+                conformation_index += 1
+                pdb_content = []
+            else:
+                pdb_content.append(line.strip())
+
+    if pdb_content:
+        pdb_filename = os.path.join(output_dir, f'conformation_{conformation_index}.pdb')
+        with open(pdb_filename, 'w') as pdb_file:
+            pdb_file.write('\n'.join(pdb_content) + '\nENDMDL\n')
+
+
+def process_all_pdb_files(directory, non_natural_aa_codes):
+    """Process all PDB files and replace residue names."""
+    for filename in os.listdir(directory):
+        if filename.endswith('.pdb'):
+            pdb_filepath = os.path.join(directory, filename)
+            remove_ace_nme_lines(pdb_filepath)
+
+            lines = []
+            with open(pdb_filepath, 'r') as f:
+                for idx, line in enumerate(f):
+                    if line.strip() == 'ENDMDL':
+                        lines.append(line)
+                        continue
+                    if idx < len(non_natural_aa_codes):
+                        code = non_natural_aa_codes[idx]
+                        line = line[:12] + code + line[16:]
+                    lines.append(line)
+
+            with open(pdb_filepath, 'w') as f:
+                f.write(''.join(lines))
+
+            print(f"Processed: {filename}")
+
+
+def combine_pdb_files(output_filename, split_pdb_dir='split_pdbs'):
+    """Combine individual PDB files into multi-MODEL file."""
+    with open(output_filename, 'w') as output_file:
+        conformation_index = 1
+        for filename in sorted(os.listdir(split_pdb_dir)):
+            if filename.endswith('.pdb'):
+                pdb_filepath = os.path.join(split_pdb_dir, filename)
+                with open(pdb_filepath, 'r') as pdb_file:
+                    output_file.write(f"MODEL     {conformation_index}\n")
+                    for line in pdb_file:
+                        output_file.write(line)
+                    conformation_index += 1
+
+
+def adjust_hetatm_records(pdb_filename):
+    """Adjust HETATM serial numbers (subtract 12 for residue atoms)."""
+    lines = []
+    with open(pdb_filename, 'r') as f:
+        for line in f:
+            if line.startswith('HETATM'):
+                original_number = int(line[9:11])
+                modified_number = original_number - 12
+                if modified_number < 10:
+                    line = f"{line[:9]} {modified_number}{line[11:]}"
+                else:
+                    line = f"{line[:9]}{modified_number}{line[11:]}"
+            lines.append(line)
+
+    with open(pdb_filename, 'w') as f:
+        f.writelines(lines)
+
+
+def modify_rotamer_pdb(non_natural_aa_abbreviation):
+    """Process rotamer PDB file for final output."""
+    params_filename = f"{non_natural_aa_abbreviation}_temps.params"
+
+    # Read atom names from params
+    non_natural_aa_codes = []
+    with open(params_filename, 'r') as f:
+        for line in f:
+            if line.startswith('ATOM'):
+                code = line.strip()[5:9]
+                non_natural_aa_codes.append(code)
+
+    # Split, process, and recombine
+    input_pdb_file = 'aligned_combined_pdb_files.pdb'
+    split_pdb_file(input_pdb_file)
+
+    process_all_pdb_files('split_pdbs', non_natural_aa_codes)
+
+    combined_pdb_filename = 'merged_combined_pdb_files.pdb'
+    combine_pdb_files(combined_pdb_filename, 'split_pdbs')
+
+    adjust_hetatm_records(combined_pdb_filename)
+
+    # Cleanup
+    import shutil
+    shutil.rmtree('split_pdbs')
+    print(f"Created {combined_pdb_filename}")
+
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+def delete_temp_files():
+    """Delete temporary intermediate files."""
+    files_to_delete = [
+        'combined_pdb_files.pdb',
+        'combined_sorted_pdb_files.pdb',
+        'aligned_combined_pdb_files.pdb',
+        'prechi_structure.pdb',
+        'Chi_screen.pdb'
+    ]
+
+    for file in files_to_delete:
+        try:
+            os.remove(file)
+            print(f"Deleted {file}")
+        except FileNotFoundError:
+            pass
+
+    for dir_name in ['pdb_files', 'split_pdb_files']:
+        if os.path.exists(dir_name):
+            import shutil
+            shutil.rmtree(dir_name)
+            print(f"Deleted '{dir_name}' directory")
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+
+def main(n_value, rmsd_threshold, clean=False):
+    """Main paramsgen pipeline."""
+
+    # Step 1: Generate params files from MOL
+    print("\n=== Generating Rosetta params files ===")
+    mol_files = [f for f in os.listdir('mol') if f.endswith('.mol')]
+
+    for mol_file in mol_files:
+        base_name = os.path.splitext(mol_file)[0]
+        name = base_name.split('_')[0]
+        mol_filepath = os.path.join('mol', mol_file)
+
+        molfile_to_params(mol_filepath, name)
+        molfile_to_params_temps(mol_filepath, name)
+
+    # Step 2: Process ICOOR parameters
+    print("\n=== Updating ICOOR parameters ===")
+    process_params_file(n_value)
+
+    # Step 3: Process charges
+    print("\n=== Processing charges ===")
+    process_charges(n_value)
+
+    # Step 4: Determine RMSD threshold
+    # Get v_value from previous stage (stored in global or calculate from input)
+    # For now, use provided threshold or default
+    print(f"\nRMSD threshold: {rmsd_threshold}")
+
+    # Step 5: RMSD screening
+    print("\n=== RMSD screening ===")
+    # v_value would typically be passed from prepff; using default here
+    v_value = 30  # Default, should be read from prepff output
+    screen_rmsd(rmsd_threshold, v_value)
+
+    # Step 6: Chi angle screening
+    print("\n=== Chi angle screening ===")
+    args_params = f'{n_value}_temps.params'
+    chi_screen(args_params)
+
+    # Step 7: Merge unique conformers
+    print("\n=== Merging conformers ===")
+    append_unique_conformers('Chi_screen.pdb', 'aligned_combined_pdb_files.pdb')
+
+    # Step 8: Process final rotamer PDB
+    print("\n=== Processing rotamer PDB ===")
+    modify_rotamer_pdb(n_value)
+
+    # Step 9: Add PDB_ROTAMERS line to params
+    print("\n=== Finalizing params file ===")
+    filename = f'{n_value}.params'
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+
+    lines.append('PDB_ROTAMERS merged_combined_pdb_files.pdb\n')
+
+    with open(filename, 'w') as f:
+        f.writelines(lines)
+
+    print(f"Added PDB_ROTAMERS to {filename}")
+
+    # Cleanup if requested
+    if clean:
+        print("\n=== Cleaning temporary files ===")
+        delete_temp_files()
+
+    print("\n=== paramsgen completed successfully ===")
+    print(f"Output files:")
+    print(f"  - {n_value}.params")
+    print(f"  - {n_value}_temps.params")
+    print(f"  - merged_combined_pdb_files.pdb")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='ParamsGen - Generate Rosetta parameter files for NCAA',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    paramsgen -n 03S
+    paramsgen -n 03S -r 0.5
+    paramsgen -n 03S -c
+        """)
+    parser.add_argument('-n', '--name', required=True,
+                        help='Residue name (e.g., 03S)')
+    parser.add_argument('-r', '--rmsd_threshold', type=float, default=0.001,
+                        help='RMSD threshold for conformer screening (default: 0.001, auto-adjusts based on complexity)')
+    parser.add_argument('-c', '--clean', action='store_true',
+                        help='Clean temporary files after completion')
+    parser.add_argument('--resp_folder', default='RESP',
+                        help='Path to RESP folder (default: RESP)')
+
+    args = parser.parse_args()
+    main(args.name, args.rmsd_threshold, args.clean)

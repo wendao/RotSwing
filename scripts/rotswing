@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""
+rotswing - Master script for NCAA parameterization pipeline
+
+Convenience wrapper to run the full prepff → paramsgen → topolgen pipeline
+in sequence.
+
+Usage:
+    rotswing -i input.smiles -n XXX [options]
+
+Options are passed through to the respective sub-scripts.
+"""
+
+import argparse
+import subprocess
+import sys
+import os
+
+
+def run_prepff(input_file, names, cutoff, method):
+    """Run prepff stage."""
+    print("\n" + "="*60)
+    print("STAGE 1: prepff - Generating intermediate files")
+    print("="*60)
+
+    cmd = [
+        'prepff',
+        '-i', input_file,
+        '-n'] + names + [
+        '-c', str(cutoff),
+        '-m', method
+    ]
+
+    result = subprocess.run(cmd)
+    return result.returncode == 0
+
+
+def run_paramsgen(name, rmsd_threshold, clean):
+    """Run paramsgen stage."""
+    print("\n" + "="*60)
+    print("STAGE 2: paramsgen - Generating Rosetta params files")
+    print("="*60)
+
+    cmd = [
+        'paramsgen',
+        '-n', name,
+        '-r', str(rmsd_threshold)
+    ]
+
+    if clean:
+        cmd.append('-c')
+
+    result = subprocess.run(cmd)
+    return result.returncode == 0
+
+
+def run_topolgen(name, resp_folder):
+    """Run topolgen stage."""
+    print("\n" + "="*60)
+    print("STAGE 3: topolgen - Generating GROMACS topology files")
+    print("="*60)
+
+    cmd = [
+        'topolgen',
+        '-n', name,
+        '--resp_folder', resp_folder
+    ]
+
+    result = subprocess.run(cmd)
+    return result.returncode == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='RotSwing - NCAA Parameterization Pipeline',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Full pipeline
+    rotswing -i input.smiles -n 03S
+
+    # With custom settings
+    rotswing -i input.smiles -n 03S -c 50 -r 0.5 -m gaussian
+
+Stages:
+    1. prepff    : Generate intermediate files (SMILES → MOL2)
+    2. paramsgen : Generate Rosetta params files
+    3. topolgen  : Generate GROMACS topology files
+        """)
+
+    # Required arguments
+    parser.add_argument('-i', '--input', required=True,
+                        help='Input SMILES file')
+    parser.add_argument('-n', '--names', required=True, nargs='+',
+                        help='Residue name(s)')
+
+    # prepff options
+    parser.add_argument('-c', '--cut_off', type=int, default=10000,
+                        help='Conformer generation cutoff (default: 10000)')
+    parser.add_argument('-m', '--method', choices=['gaussian', 'aimnet'],
+                        default='gaussian', help='Optimization method')
+
+    # paramsgen options
+    parser.add_argument('-r', '--rmsd_threshold', type=float, default=0.001,
+                        help='RMSD threshold (default: 0.001)')
+    parser.add_argument('--clean', action='store_true',
+                        help='Clean temporary files after completion')
+
+    # topolgen options
+    parser.add_argument('--resp_folder', default='RESP',
+                        help='RESP folder path (default: RESP)')
+
+    # Pipeline control
+    parser.add_argument('--stage', choices=['prepff', 'paramsgen', 'topolgen', 'all'],
+                        default='all', help='Run specific stage only (default: all)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Print commands without executing')
+
+    args = parser.parse_args()
+
+    # Ensure scripts are in PATH
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in os.environ['PATH']:
+        os.environ['PATH'] = script_dir + ':' + os.environ['PATH']
+
+    success = True
+
+    # Run stages
+    if args.stage in ('prepff', 'all'):
+        if args.dry_run:
+            print(f"[DRY RUN] Would run: prepff -i {args.input} -n {' '.join(args.names)} "
+                  f"-c {args.cut_off} -m {args.method}")
+        else:
+            success = run_prepff(args.input, args.names, args.cut_off, args.method)
+            if not success:
+                print("ERROR: prepff stage failed")
+                return 1
+
+    if args.stage in ('paramsgen', 'all'):
+        if args.dry_run:
+            print(f"[DRY RUN] Would run: paramsgen -n {args.names[0]} -r {args.rmsd_threshold} "
+                  f"{'-c' if args.clean else ''}")
+        else:
+            success = run_paramsgen(args.names[0], args.rmsd_threshold, args.clean)
+            if not success:
+                print("ERROR: paramsgen stage failed")
+                return 1
+
+    if args.stage in ('topolgen', 'all'):
+        if args.dry_run:
+            print(f"[DRY RUN] Would run: topolgen -n {args.names[0]} --resp_folder {args.resp_folder}")
+        else:
+            success = run_topolgen(args.names[0], args.resp_folder)
+            if not success:
+                print("ERROR: topolgen stage failed")
+                return 1
+
+    if args.stage == 'all' and success:
+        print("\n" + "="*60)
+        print("All stages completed successfully!")
+        print("="*60)
+        print(f"\nOutput files:")
+        print(f"  Rosetta:  {args.names[0]}.params")
+        print(f"  GROMACS:  {args.names[0]}_gromacs_prm/{args.names[0]}.top")
+        print(f"  RTP:      {args.names[0]}.rtp")
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

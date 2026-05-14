@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+topolgen - Generate GROMACS topology files (.top, .rtp)
+
+Phase 3 of NCAA parameterization pipeline.
+Generates GROMACS topology files from intermediate MOL2 files.
+Uses AmberTools (tleap, parmchk2) and acpype for conversion.
+
+Usage:
+    topolgen -n XXX
+
+Input:
+    - RESP/XXX_1.mol2       : MOL2 file with RESP charges from prepff
+
+Output:
+    - XXX_gromacs_prm/      : Directory with GROMACS files
+        - XXX.top           : GROMACS topology file
+        - XXX.gro           : GROMACS coordinate file
+    - XXX.rtp               : GROMACS residue topology file
+"""
+
+import os
+import argparse
+import shutil
+import re
+
+
+# ============================================================================
+# GROMACS Topology Generation
+# ============================================================================
+
+def generate_top(res, mol2_file, output_folder):
+    """Generate GROMACS topology from MOL2 file using AmberTools."""
+
+    # Create output directory
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # Generate .mod file with parmchk2
+    mod_file = f'{res}.mod'
+    print(f"Running parmchk2 for {mol2_file}...")
+    os.system(f'parmchk2 -i {mol2_file} -f mol2 -o {mod_file}')
+
+    # Create tleap input file
+    leapin_filename = f'{res}_leap.in'
+    with open(leapin_filename, 'w') as leapin:
+        leapin.write('source /home/rotations/.conda/envs/rdkit/dat/leap/cmd/leaprc.protein.ff19SB\n')
+        leapin.write(f'loadamberparams {mod_file}\n')
+        leapin.write(f'mol=loadmol2 {mol2_file}\n')
+        leapin.write('check mol\n')
+        leapin.write(f'saveamberparm mol {res}.prm {res}.crd\n')
+        leapin.write('quit\n')
+
+    # Run tleap
+    print(f"Running tleap for {res}...")
+    os.system(f'tleap -f {leapin_filename}')
+
+    # Move generated files to output folder
+    generated_files = [f'{res}.prm', f'{res}.crd', mod_file, leapin_filename, 'leap.log']
+    for file in generated_files:
+        if os.path.exists(file):
+            shutil.move(file, os.path.join(output_folder, file))
+
+    # Run acpype for GROMACS conversion
+    print(f"Running acpype for GROMACS conversion...")
+    original_dir = os.getcwd()
+    os.chdir(output_folder)
+
+    prm_file = f'{res}.prm'
+    crd_file = f'{res}.crd'
+    os.system(f'acpype -p {prm_file} -x {crd_file} -c user -o gmx -a amber')
+
+    os.chdir(original_dir)
+
+    # Move GROMACS files to output folder
+    gromacs_files = ['MOL_GMX.gro', 'MOL_GMX.top']
+    for file in gromacs_files:
+        src = os.path.join(output_folder, file)
+        if os.path.exists(file):
+            ext = file.split('_')[-1].lower()
+            dst = os.path.join(output_folder, f'{res}.{ext}')
+            shutil.move(file, dst)
+
+    # Clean up intermediate files
+    for temp_file in ['qout', 'QOUT', 'punch', 'md.mdp', 'esout', 'em.mdp']:
+        temp_path = os.path.join(output_folder, temp_file)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    print(f'Generated GROMACS topology for {res}')
+
+
+def generate_all_tops(resp_folder):
+    """Generate GROMACS topology for all MOL2 files in RESP folder."""
+    res_rtp = None
+
+    for mol2_file in os.listdir(resp_folder):
+        if mol2_file.endswith('.mol2'):
+            res = mol2_file[:3]
+            res_rtp = res
+
+            output_folder = f'./{res}_gromacs_prm'
+            mol2_path = os.path.join(resp_folder, mol2_file)
+
+            generate_top(res, mol2_path, output_folder)
+
+    print(f'\nGROMACS top files generated in "*_gromacs_prm" folders!\n')
+    return res_rtp
+
+
+# ============================================================================
+# RTP File Generation
+# ============================================================================
+
+def generate_rtp(res, top_file, output_rtp_file):
+    """Generate GROMACS RTP file from topology file."""
+
+    ignore_atoms = ["ACE", "NME", "linker"]
+
+    with open(top_file, 'r') as f_top:
+        top = f_top.readlines()
+
+    # Find section boundaries
+    try:
+        start_atom = top.index('[ atoms ]\n') + 2
+        start_bond = top.index('[ bonds ]\n') + 2
+        end_atom = top.index('[ bonds ]\n') - 1
+        end_bond = top.index('[ pairs ]\n') - 1
+        start_angle = top.index('[ angles ]\n') + 2
+        end_angle = top.index('[ dihedrals ] ; propers\n') - 1
+        start_dihedral = top.index('[ dihedrals ] ; propers\n') + 3
+        end_dihedral = top.index('[ dihedrals ] ; impropers\n') - 1
+        start_improper = top.index('[ dihedrals ] ; impropers\n') + 3
+        end_improper = top.index('[ system ]\n') - 1
+    except ValueError as e:
+        print(f"Error parsing topology file: {e}")
+        return
+
+    def include_ffparm(atom_nums, atom_names):
+        """Check if atom/bond/angle should be included (exclude caps)."""
+        for i in atom_nums:
+            if int(i) < 13:  # Skip ACE/NME atoms (first 12)
+                return False
+        for j in atom_names:
+            if j in ignore_atoms:
+                return False
+        return True
+
+    # Build RTP content
+    rtp_list = []
+    rtp_list.append(f'[ {res} ]\n')
+    rtp_list.append(' [ atoms ]\n')
+
+    # Process atoms
+    for i in range(start_atom, end_atom):
+        line = top[i]
+        atom = list(filter(None, line.replace('\n', '').split()))
+
+        atom_nums, atom_names = [atom[0]], [atom[4]]
+        atom_name, atom_type, atom_charge, atom_num = atom[4], atom[1], atom[6], int(atom[0]) - 12
+
+        if include_ffparm(atom_nums, atom_names):
+            rtp_list.append(f'    {atom_name:>4}   {atom_type:>2}    {atom_charge:>9}    {atom_num:>2}\n')
+
+    # Process bonds
+    rtp_list.append('\n [ bonds ]\n')
+    for j in range(start_bond, end_bond):
+        line = top[j]
+        bond = list(filter(None, line.replace('\n', '').split()))
+
+        atom_nums, atom_names = bond[0:2], [bond[-3], bond[-1]]
+        if include_ffparm(atom_nums, atom_names):
+            rtp_list.append(f'    {bond[-3]:>4}   {bond[-1]:<4}  {bond[3]}    {bond[4]}\n')
+
+    # Add backbone bond
+    rtp_list.append(f'    {"-C":>4}   {"N":<4}  1.3790e-01    3.5782e+05\n')
+
+    # Process angles
+    rtp_list.append('\n [ angles ]\n')
+    for k in range(start_angle, end_angle):
+        line = top[k]
+        angle = list(filter(None, line.replace('\n', '').split()))
+
+        atom_nums, atom_names = angle[0:3], [angle[-5], angle[-3], angle[-1]]
+        if include_ffparm(atom_nums, atom_names):
+            rtp_list.append(f'    {angle[-5]:>4}   {angle[-3]:>4}    {angle[-1]:<4}  {angle[4]}   {angle[5]}\n')
+
+    # Process dihedrals (propers)
+    rtp_list.append('\n [ dihedrals ] ; propers\n')
+    for l in range(start_dihedral, end_dihedral):
+        line = top[l].replace('-', ' ')
+        dihedral = list(filter(None, line.replace('\n', '').split()))
+
+        atom_nums, atom_names = dihedral[0:4], [dihedral[-4], dihedral[-3], dihedral[-2], dihedral[-1]]
+        if include_ffparm(atom_nums, atom_names):
+            rtp_list.append(f'    {dihedral[-4]:>4}   {dihedral[-3]:>4}   {dihedral[-2]:>4}   {dihedral[-1]:<4}  '
+                           f'{dihedral[5]:>6}   {dihedral[6]:>8}   {dihedral[7]}\n')
+
+    # Process dihedrals (impropers)
+    rtp_list.append('\n [ dihedrals ] ; impropers\n')
+    for m in range(start_improper, end_improper):
+        line = top[m].replace('-', ' ')
+        improper = list(filter(None, line.replace('\n', '').split()))
+
+        atom_nums, atom_names = improper[0:4], [improper[-4], improper[-3], improper[-2], improper[-1]]
+        if include_ffparm(atom_nums, atom_names):
+            rtp_list.append(f'    {improper[-4]:>4}   {improper[-3]:>4}   {improper[-2]:>4}   {improper[-1]:<4}  '
+                           f'{improper[5]:>6}   {improper[6]:>8}   {improper[7]}\n')
+
+    # Add standard backbone impropers
+    rtp_list.append('    -C    CA     N     H  180.00   4.60240   2\n')
+    rtp_list.append('    CA    +N     C     O  180.00   4.60240   2\n')
+
+    # Write RTP file
+    with open(output_rtp_file, 'w') as f_rtp:
+        for line in rtp_list:
+            f_rtp.write(line)
+
+    print(f"Generated RTP file: {output_rtp_file}")
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+
+def main(n_value, resp_folder='RESP'):
+    """Main topolgen pipeline."""
+
+    print("\n=== Generating GROMACS topology files ===")
+
+    # Step 1: Generate topology files
+    res_rtp = generate_all_tops(resp_folder)
+
+    if res_rtp is None:
+        print("Error: No MOL2 files found in RESP folder")
+        return
+
+    # Step 2: Generate RTP file
+    print("\n=== Generating RTP file ===")
+    top_file = f"{res_rtp}_gromacs_prm/MOL.amb2gmx/MOL_GMX.top"
+
+    # Alternative path if acpype structure differs
+    alt_top_file = f"{res_rtp}_gromacs_prm/{res_rtp}.top"
+
+    if os.path.exists(top_file):
+        generate_rtp(res_rtp, top_file, f'{res_rtp}.rtp')
+    elif os.path.exists(alt_top_file):
+        generate_rtp(res_rtp, alt_top_file, f'{res_rtp}.rtp')
+    else:
+        # Find any .top file in the gromacs_prm folder
+        gromacs_dir = f"{res_rtp}_gromacs_prm"
+        top_files = [f for f in os.listdir(gromacs_dir) if f.endswith('.top')]
+
+        if top_files:
+            top_path = os.path.join(gromacs_dir, top_files[0])
+            generate_rtp(res_rtp, top_path, f'{res_rtp}.rtp')
+        else:
+            print(f"Error: No topology file found in {gromacs_dir}")
+            return
+
+    print("\n=== topolgen completed successfully ===")
+    print(f"Output files:")
+    print(f"  - {res_rtp}_gromacs_prm/{res_rtp}.top")
+    print(f"  - {res_rtp}_gromacs_prm/{res_rtp}.gro")
+    print(f"  - {res_rtp}.rtp")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='TopolGen - Generate GROMACS topology files for NCAA',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    topolgen -n 03S
+    topolgen -n 03S --resp_folder RESP
+
+Requirements:
+    - AmberTools (tleap, parmchk2)
+    - acpype
+    - MOL2 files from prepff in RESP folder
+        """)
+    parser.add_argument('-n', '--name', required=True,
+                        help='Residue name (e.g., 03S)')
+    parser.add_argument('--resp_folder', default='RESP',
+                        help='Path to RESP folder containing MOL2 files (default: RESP)')
+
+    args = parser.parse_args()
+    main(args.name, args.resp_folder)

@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+"""
+prepff - Prepare Force Field intermediate files
+
+Phase 1 of NCAA parameterization pipeline.
+Generates intermediate files including capped SMILES, conformers, optimized structures,
+RESP charges, and atom type assignments.
+
+Usage:
+    prepff -i input.smiles -n XXX [-c cutoff] [-m gaussian|aimnet]
+
+Output:
+    - RESP/XXX_1.mol2      : MOL2 file with RESP charges
+    - mol/XXX_opt.mol      : MOL file for Rosetta params generation
+    - PDB_rearranged/      : Directory with processed PDB files
+"""
+
+import os
+import argparse
+import re
+import numpy as np
+import shutil
+import random
+import subprocess
+import time
+import math
+from rdkit.Chem import Lipinski
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit.Chem.rdForceFieldHelpers import UFFGetMoleculeForceField
+from rdkit.Chem.rdMolTransforms import SetDihedralDeg
+
+
+# ============================================================================
+# Constants and SMARTS Patterns
+# ============================================================================
+
+ACETYLATION_SMARTS = '[N:1][C:2][C:3](=[O:4])>>[C:5][C:7](=[O:6])[N:1][C:2][C:3](=[O:4])'
+AMIDATION_SMARTS = '[C:1][C:2](=[O:3])[O:4]>>[C:1][C:2]([N:5][C:6])(=[O:3])'
+
+# Default RMSD thresholds based on v_value
+RMSD_THRESHOLDS = {
+    10: 0.80,
+    30: 0.60,
+    90: 0.40,
+    270: 0.20,
+    810: 0.10
+}
+
+
+# ============================================================================
+# Input Processing and Capping
+# ============================================================================
+
+def count_rotatable_bonds(smiles_file, cut_off):
+    """Count rotatable bonds and determine conformer generation parameters."""
+    with open(smiles_file, 'r') as file:
+        smiles_list = [line.strip() for line in file.readlines()]
+
+    results = []
+    for smiles in smiles_list:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Warning: Unable to parse SMILES: '{smiles}'")
+            continue
+
+        num_rotatable_bonds = Lipinski.NumRotatableBonds(mol)
+        if cut_off == 10000:
+            # Default values based on rotatable bond count
+            thresholds = {2: (10, 10000), 3: (30, 10000), 4: (90, 10000),
+                         5: (270, 10000), 6: (810, 10000)}
+            v_value, c_value = thresholds.get(num_rotatable_bonds, (cut_off, 10000))
+            if num_rotatable_bonds >= 6:
+                v_value, c_value = 810, 10000
+        else:
+            v_value, c_value = cut_off, 10000
+
+        results.append((smiles, num_rotatable_bonds, c_value, v_value))
+
+    return results
+
+
+def process_smiles(smiles):
+    """Apply N-terminal acetylation and C-terminal amidation to SMILES."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Unable to parse SMILES: '{smiles}'")
+
+    rxn_acetylation = AllChem.ReactionFromSmarts(ACETYLATION_SMARTS)
+    rxn_amidation = AllChem.ReactionFromSmarts(AMIDATION_SMARTS)
+
+    # Apply C-terminal amidation first
+    products_amidation = rxn_amidation.RunReactants((mol,))
+    if not products_amidation:
+        raise ValueError("C-terminal amidation failed")
+    product_amidation = products_amidation[0][0]
+
+    # Apply N-terminal acetylation
+    products_acetylation = rxn_acetylation.RunReactants((product_amidation,))
+    if not products_acetylation:
+        raise ValueError("N-terminal acetylation failed")
+    product_acetylation = products_acetylation[0][0]
+
+    return Chem.MolToSmiles(product_acetylation, canonical=False)
+
+
+def gen_smiles(input_file, names_list):
+    """Generate capped SMILES for all input SMILES."""
+    with open(input_file, 'r') as f:
+        smiles_list = [line.strip() for line in f.readlines()]
+
+    if len(names_list) != len(smiles_list):
+        raise ValueError("Number of names does not match number of SMILES strings.")
+
+    processed_smiles_list = []
+    for smiles in smiles_list:
+        try:
+            processed_smiles = process_smiles(smiles)
+            processed_smiles_list.append(processed_smiles)
+        except ValueError as e:
+            print(e)
+            continue
+
+    return processed_smiles_list
+
+
+# ============================================================================
+# Conformer Generation
+# ============================================================================
+
+def smiles_to_pdb(smiles_list, names_list, output_dir):
+    """Convert SMILES to 3D PDB structures using RDKit."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    if len(names_list) < len(smiles_list):
+        names_list.extend(['UAA'] * (len(smiles_list) - len(names_list)))
+
+    generated_files = []
+    for i, (smiles, name) in enumerate(zip(smiles_list, names_list)):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Warning: Unable to parse SMILES: '{smiles}'")
+            continue
+
+        mol = Chem.AddHs(mol)
+        random_seed = random.randint(1, 1000000)
+        params = AllChem.ETKDG()
+        params.randomSeed = random_seed
+        AllChem.EmbedMolecule(mol, params)
+
+        # UFF optimization
+        ff = UFFGetMoleculeForceField(mol)
+        ff.Initialize()
+        ff.Minimize()
+        energy = ff.CalcEnergy()
+
+        pdb_filename = os.path.join(output_dir, f'{name}_{i+1}.pdb')
+        with open(pdb_filename, 'w') as pdb_file:
+            pdb_file.write(f"REMARK SMILES: {smiles}\n")
+            pdb_file.write(f"REMARK Energy after optimization: {energy:.2f} kcal/mol\n")
+            pdb_file.write(Chem.rdmolfiles.MolToPDBBlock(mol))
+
+        generated_files.append(pdb_filename)
+        print(f"Generated {pdb_filename}")
+
+    return generated_files
+
+
+def gen_conformers(processed_smiles_list, names_list):
+    """Generate conformers from processed SMILES."""
+    output_dir = 'pdb_files'
+    return smiles_to_pdb(processed_smiles_list, names_list, output_dir)
+
+
+def append_pdb_to_combined_file(pdb_file, combined_file):
+    """Append PDB content to combined file."""
+    with open(pdb_file, 'r') as f_pdb:
+        pdb_content = f_pdb.read()
+    with open(combined_file, 'a') as f_combined:
+        f_combined.write(pdb_content)
+
+
+# ============================================================================
+# PDB Processing and Reordering
+# ============================================================================
+
+def extract_energy_from_pdb(pdb_content):
+    """Extract energy value from PDB REMARK line."""
+    lines = pdb_content.splitlines()
+    for line in lines:
+        if line.startswith("REMARK Energy after optimization:"):
+            match = re.search(r'[-+]?\d*\.\d+', line)
+            if match:
+                return float(match.group())
+    raise ValueError("No energy information found in PDB content")
+
+
+def process_pdb_file(filepath, n_value, output_filepath, energy_value):
+    """Reorder atoms in PDB file to standard order (ACE, NME, residue)."""
+    with open(filepath, 'r') as file:
+        lines = file.readlines()
+
+    energy_line = f"REMARK Energy after optimization: {energy_value:.2f}\n"
+    lines = [line for line in lines if line.startswith("HETATM") or line.startswith("ATOM  ")]
+
+    # Standard atom ordering for ACE/NME caps
+    atom_order = ["C2", "O1", "C1", "H1", "H2", "H3",
+                  "N2", "C5", "H6", "H7", "H8", "H9",
+                  "N1", "C3", "C4", "O2", "H4", "H5"]
+    line_dict = {key: None for key in atom_order}
+    other_lines = []
+
+    for line in lines:
+        atom_name = line[12:16].strip()
+        if atom_name in line_dict:
+            line_dict[atom_name] = line
+        else:
+            other_lines.append(line)
+
+    # Reorder lines
+    reordered_lines = []
+    for key in atom_order[:-2]:  # Exclude H4, H5 for now
+        if line_dict[key] is not None:
+            reordered_lines.append(line_dict[key])
+
+    reordered_lines.extend(other_lines)
+
+    if line_dict["H4"] is not None:
+        reordered_lines.append(line_dict["H4"])
+    if line_dict["H5"] is not None:
+        reordered_lines.append(line_dict["H5"])
+
+    # Update residue names
+    for i in range(len(reordered_lines)):
+        if i < 6:
+            reordered_lines[i] = reordered_lines[i][:17] + "ACE" + reordered_lines[i][20:]
+        elif i < 12:
+            reordered_lines[i] = reordered_lines[i][:17] + "NME" + reordered_lines[i][20:]
+        else:
+            reordered_lines[i] = reordered_lines[i][:17] + n_value + reordered_lines[i][20:]
+
+    reordered_lines.insert(0, energy_line)
+    reordered_lines.append("END\n")
+
+    with open(output_filepath, 'w') as file:
+        file.writelines(reordered_lines)
+
+
+def split_combined_pdb(combined_pdb_file, output_dir, n_value):
+    """Split combined PDB file into individual conformers sorted by energy."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    pdb_files = []
+    energies = {}
+
+    with open(combined_pdb_file, 'r') as f:
+        content = f.read().strip().split('END\n')
+
+    for idx, pdb_block in enumerate(content):
+        if pdb_block.strip():
+            pdb_content = pdb_block.strip() + '\nEND'
+            energy = extract_energy_from_pdb(pdb_content)
+            pdb_filename = os.path.join(output_dir, f'conformer_{energy:.2f}.pdb')
+
+            with open(pdb_filename, 'w') as pdb_out:
+                pdb_out.write(pdb_content)
+
+            pdb_files.append((pdb_filename, energy))
+            energies[pdb_filename] = energy
+
+            # Process and reorder atoms
+            output_filepath = f"{pdb_filename}_processed.pdb"
+            process_pdb_file(pdb_filename, n_value, output_filepath, energy)
+            print(f"Processed PDB file: {output_filepath}")
+
+    # Sort by energy and create combined sorted file
+    sorted_files = sorted(pdb_files, key=lambda x: x[1])
+    combined_sorted_file = 'combined_sorted_pdb_files.pdb'
+
+    with open(combined_sorted_file, 'w') as f_combined:
+        for pdb_file, _ in sorted_files:
+            with open(pdb_file + "_processed.pdb", 'r') as f_pdb:
+                f_combined.write(f_pdb.read())
+
+    return combined_sorted_file
+
+
+def calculate_system_charge(smiles_filepath):
+    """Calculate net system charge from SMILES."""
+    with open(smiles_filepath, 'r') as file:
+        smiles = file.read().strip()
+    return smiles.count('+') - smiles.count('-')
+
+
+# ============================================================================
+# Dihedral Adjustment
+# ============================================================================
+
+def set_dihedral_angle(mol, atom_indices, angle):
+    """Set dihedral angle for specified atoms."""
+    try:
+        SetDihedralDeg(mol.GetConformer(), *atom_indices, angle)
+    except Exception as e:
+        print(f"Error setting dihedral angle for atoms {atom_indices}: {e}")
+
+
+def adjust_dihedrals_in_pdb_files(filepaths):
+    """Adjust backbone dihedrals for peptide or peptoid conformers."""
+    for pdb_path in filepaths:
+        mol = Chem.MolFromPDBFile(pdb_path, removeHs=False)
+        if mol is None:
+            print(f"Unable to load PDB file: {pdb_path}")
+            continue
+
+        atom_indices = {atom.GetPDBResidueInfo().GetName().strip(): atom.GetIdx()
+                       for atom in mol.GetAtoms()}
+
+        N1_atom = mol.GetAtomWithIdx(atom_indices['N1'])
+        non_h_neighbors = [nbr for nbr in N1_atom.GetNeighbors() if nbr.GetSymbol() != 'H']
+
+        if len(non_h_neighbors) == 2:
+            # Peptide
+            set_dihedral_angle(mol, [atom_indices['C2'], atom_indices['N1'],
+                                    atom_indices['C3'], atom_indices['C4']], -150.0)
+            set_dihedral_angle(mol, [atom_indices['N1'], atom_indices['C3'],
+                                    atom_indices['C4'], atom_indices['N2']], 150.0)
+        elif len(non_h_neighbors) == 3:
+            # Peptoid
+            set_dihedral_angle(mol, [atom_indices['C2'], atom_indices['N1'],
+                                    atom_indices['C3'], atom_indices['C4']], -120.0)
+            set_dihedral_angle(mol, [atom_indices['N1'], atom_indices['C3'],
+                                    atom_indices['C4'], atom_indices['N2']], 90.0)
+
+        with open(pdb_path, 'w') as f:
+            f.write(Chem.MolToPDBBlock(mol))
+
+        print(f"Adjusted dihedrals in {pdb_path}")
+
+
+def remove_conect_lines_from_pdb(pdb_filepath):
+    """Remove CONECT lines from PDB file (can cause antechamber issues)."""
+    with open(pdb_filepath, 'r') as f:
+        lines = f.readlines()
+    lines = [line for line in lines if not line.startswith("CONECT")]
+    with open(pdb_filepath, 'w') as f:
+        f.writelines(lines)
+
+
+# ============================================================================
+# Gaussian Input Generation
+# ============================================================================
+
+def submit_gaussian_job(gjf_filepath):
+    """Submit Gaussian job to queue."""
+    command = f"/home/rotations/Leon/g16/g16/g16 < {gjf_filepath} > {gjf_filepath.replace('.gjf', '.log')} &"
+    subprocess.Popen(command, shell=True)
+    print(f"Submitted Gaussian job for {gjf_filepath}")
+
+
+def modify_gjf_file(gjf_filepath, system_charge):
+    """Modify Gaussian input file with charge, memory, and processor settings."""
+    with open(gjf_filepath, 'r') as file:
+        lines = file.readlines()
+
+    # Update charge
+    for i in range(len(lines)):
+        if lines[i].strip() == "0   1":
+            lines[i] = f"{system_charge}   1\n"
+            break
+
+    # Set memory and processors
+    if len(lines) > 1:
+        lines[0] = "%mem=100GB\n"
+        lines[1] = "%nprocshared=24\n"
+    else:
+        lines.insert(0, "%mem=100GB\n")
+        lines.insert(1, "%nprocshared=24\n")
+
+    # Add dihedral constraints
+    non_empty_lines = [line for line in lines if line.strip()]
+    last_non_empty_line_index = lines.index(non_empty_lines[-1])
+    lines.insert(last_non_empty_line_index + 1, '\n13 14 15 7 F\n1 13 14 15 F\n\n\n\n')
+
+    with open(gjf_filepath, 'w') as file:
+        file.writelines(lines)
+
+
+def generate_gaussian_input(filepaths, output_dir, system_charge):
+    """Generate Gaussian input files from PDB structures."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    for pdb_path in filepaths:
+        base_name = os.path.splitext(os.path.basename(pdb_path))[0]
+        gjf_filename = os.path.join(output_dir, f'{base_name}.gjf')
+        command = (f'antechamber -i {pdb_path} -fi pdb -o {gjf_filename} -fo gcrt '
+                  f'-gk "# opt=modredundant b3lyp/6-311+g(d,p) '
+                  f'scrf=(solvent=water) empiricaldispersion=gd3bj"')
+        os.system(command)
+
+        modify_gjf_file(gjf_filename, system_charge)
+        print(f"Generated {gjf_filename}")
+
+        # Create placeholder log file and submit job
+        log_filename = os.path.join(output_dir, f'{base_name}.log')
+        shutil.copy(gjf_filename, log_filename)
+        submit_gaussian_job(gjf_filename)
+
+
+def is_gaussian_job_completed(log_filepath):
+    """Check if Gaussian job completed successfully."""
+    with open(log_filepath, 'r') as file:
+        lines = file.readlines()
+    return any("Normal termination" in line for line in lines)
+
+
+# ============================================================================
+# Log Processing and MOL Generation
+# ============================================================================
+
+def process_log_files(input_file, output_dir):
+    """Process Gaussian log files and generate MOL files with polymer info."""
+    with open(input_file, 'r') as f:
+        smiles_list = [line.strip() for line in f.readlines()]
+
+    log_files = [f for f in os.listdir(output_dir) if f.endswith('.log')]
+    chirality_dict = {}
+
+    for log_file in log_files:
+        base_name = os.path.splitext(log_file)[0]
+        idx = int(base_name.split('_')[-1]) - 1
+        smiles = smiles_list[idx]
+
+        if not is_gaussian_job_completed(os.path.join(output_dir, log_file)):
+            print(f"Gaussian job for {log_file} not completed. Skipping.")
+            continue
+
+        # Determine chirality from SMILES
+        if '[C@@H]' in smiles:
+            chirality_dict[log_file] = 'L'
+        elif '[C@H]' in smiles:
+            chirality_dict[log_file] = 'D'
+        else:
+            print(f"Cannot determine chirality for {log_file}")
+            continue
+
+        mol_output_dir = 'mol'
+        if not os.path.exists(mol_output_dir):
+            os.makedirs(mol_output_dir)
+
+        log_filepath = os.path.join(output_dir, log_file)
+        mol_filepath = os.path.join(mol_output_dir, f'{base_name}_opt.mol')
+        command = f'obabel -i g16 {log_filepath} -o mol -O {mol_filepath}'
+        os.system(command)
+
+        # Add Rosetta polymer information
+        add_polymer_info(mol_filepath, chirality_dict[log_file])
+        print(f"Processed and saved {mol_filepath}")
+
+
+def add_polymer_info(mol_filepath, chirality):
+    """Add Rosetta polymer metadata to MOL file."""
+    with open(mol_filepath, 'r') as mol_file:
+        mol_lines = mol_file.readlines()
+
+    if mol_lines[-1].strip() == "M  END":
+        mol_lines = mol_lines[:-1]
+
+    # Polymer backbone atom indices (after ACE/NME caps)
+    polymer_lines = [
+        "M  ROOT 13\n",
+        "M  POLY_N_BB 13\n",
+        "M  POLY_CA_BB 14\n",
+        "M  POLY_C_BB 15\n",
+        "M  POLY_O_BB 16\n",
+        "M  POLY_IGNORE 2 3 4 5 6 8 9 10 11 12\n",
+        "M  POLY_UPPER 7\n",
+        "M  POLY_LOWER 1\n",
+    ]
+
+    if chirality == 'L':
+        polymer_lines.append("M  POLY_PROPERTIES PROTEIN L_AA ALPHA_AA\n")
+    else:
+        polymer_lines.append("M  POLY_PROPERTIES PROTEIN D_AA ALPHA_AA\n")
+
+    polymer_lines.append("M  END\n")
+    mol_lines.extend(polymer_lines)
+
+    with open(mol_filepath, 'w') as mol_file:
+        mol_file.writelines(mol_lines)
+
+
+# ============================================================================
+# RESP Charge Calculation
+# ============================================================================
+
+def generate_resp_input(res, resp):
+    """Generate Gaussian input for RESP calculation."""
+    os.system(f'antechamber -i {res}.log -fi gout -o {resp}.gjf -fo gcrt '
+              f'-gk "# HF/6-31G* SCF=Tight Pop=MK iop(6/33=2, 6/41=10, 6/42=15)"')
+    print(f'Generated RESP input file: {resp}.gjf')
+
+    # Modify GJF with memory and processor settings
+    gjf_file = f'{resp}.gjf'
+    with open(gjf_file, 'r') as file:
+        lines = file.readlines()
+
+    if len(lines) > 1:
+        lines[0] = "%mem=100GB\n"
+        lines[1] = "%nprocshared=24\n"
+
+    with open(gjf_file, 'w') as file:
+        file.writelines(lines)
+
+
+def run_resp_calculation(res, resp):
+    """Run RESP calculation and convert to MOL2 format."""
+    gjf_file = f'{resp}.gjf'
+    log_file = f'{resp}.log'
+
+    # Run Gaussian RESP calculation
+    os.system(f'/home/rotations/Leon/g16/g16/g16 {gjf_file}')
+    print(f'Completed RESP calculation: {log_file}')
+
+    # Convert to MOL2 with RESP charges
+    mol2_file = f'{resp}.mol2'
+    os.system(f'antechamber -i {log_file} -fi gout -o {mol2_file} -fo mol2 '
+              f'-at amber -pf y -c resp')
+    print(f'Generated MOL2 with RESP charges: {mol2_file}')
+
+
+def atom_type_adjust(resp_folder):
+    """Adjust atom types in MOL2 files to match params file naming."""
+    for mol2_file in os.listdir(resp_folder):
+        if mol2_file.endswith('.mol2'):
+            res = mol2_file[:3]
+            params_file = f'{res}_temps.params'
+
+            if not os.path.exists(params_file):
+                print(f"Warning: {params_file} not found for {mol2_file}")
+                continue
+
+            # Read params ATOM lines
+            params_atom_lines = []
+            with open(params_file, 'r') as f_params:
+                for line in f_params:
+                    if line.startswith('ATOM'):
+                        params_atom_lines.append(line)
+
+            # Read and modify MOL2
+            with open(os.path.join(resp_folder, mol2_file), 'r') as f_mol2:
+                mol2_lines = f_mol2.readlines()
+
+            # Find ATOM section
+            try:
+                start_idx = mol2_lines.index('@<TRIPOS>ATOM\n') + 1
+                end_idx = mol2_lines.index('@<TRIPOS>BOND\n')
+            except ValueError:
+                print(f"Error: Unable to find ATOM/BOND sections in {mol2_file}")
+                continue
+
+            # Replace atom names from params
+            mol2_atom_lines_to_replace = []
+            for i in range(start_idx, end_idx):
+                parts = mol2_lines[i].split()
+                if len(parts) >= 1:
+                    try:
+                        atom_index = int(parts[0])
+                        if atom_index >= 13:
+                            mol2_atom_lines_to_replace.append((i, mol2_lines[i]))
+                    except ValueError:
+                        continue
+
+            # Update atom names
+            for j, (i, line) in enumerate(mol2_atom_lines_to_replace):
+                if j < len(params_atom_lines):
+                    new_name = params_atom_lines[j][5:9]
+                    parts = list(line)
+                    if len(parts) >= 11:
+                        parts[7:11] = new_name
+                        mol2_lines[i] = ''.join(parts)
+
+            # Fix atom name formatting (number after letter)
+            adjusted_lines = []
+            for i in range(start_idx, end_idx):
+                line = mol2_lines[i]
+                parts = list(line)
+                if len(parts) >= 8 and parts[7].isdigit():
+                    # Move digit to position 10 or 11
+                    digit = parts[7]
+                    if len(parts) >= 11 and parts[9] != ' ' and parts[10] != ' ':
+                        parts[11] = digit
+                    elif len(parts) >= 10 and parts[9] != ' ':
+                        parts[10] = digit
+                    elif len(parts) >= 9 and parts[9] == ' ':
+                        parts[9] = digit
+                    parts[7:8] = ' '
+                    adjusted_lines.append(''.join(parts))
+                else:
+                    adjusted_lines.append(line)
+
+            for i in range(start_idx, end_idx):
+                mol2_lines[i] = adjusted_lines[i - start_idx]
+
+            # Write updated MOL2
+            output_file_path = os.path.join(resp_folder, mol2_file)
+            with open(output_file_path, 'w') as f_mol2:
+                f_mol2.writelines(mol2_lines)
+
+            print(f"Processed {mol2_file} successfully.")
+
+
+def calculate_capcharge(resp_folder):
+    """Calculate cap charges and add to N and C termini."""
+    for mol2_file in os.listdir(resp_folder):
+        if mol2_file.endswith('.mol2'):
+            res = mol2_file[:3]
+            mol2_path = os.path.join(resp_folder, mol2_file)
+
+            with open(mol2_path, 'r+') as f_mol2:
+                mol2 = f_mol2.readlines()
+
+                end = mol2.index('@<TRIPOS>BOND\n')
+                start = mol2.index('@<TRIPOS>ATOM\n')
+
+                # Calculate ACE and NME cap charges
+                ace_cap, nme_cap = 0, 0
+                for i in range(1 + start, 7 + start):
+                    lis = list(filter(None, mol2[i].replace('\n', '').split(' ')))
+                    ace_cap += float(lis[-1])
+
+                for j in range(7 + start, 13 + start):
+                    lis = list(filter(None, mol2[j].replace('\n', '').split(' ')))
+                    nme_cap += float(lis[-1])
+
+                ace_cap, nme_cap = round(ace_cap, 6), round(nme_cap, 6)
+
+                print(f'{res} - ACE cap charge: {ace_cap}')
+                print(f'{res} - NME cap charge: {nme_cap}')
+
+                # Add ACE charge to N
+                N_ncaa_line = mol2[start + 13]
+                N_ncaa = list(filter(None, N_ncaa_line.replace('\n', '').split(' ')))
+                if N_ncaa[1] == 'N':
+                    new_N_charge = round(float(N_ncaa_line[-10:-1]) + ace_cap, 6)
+                    mol2[start + 13] = N_ncaa_line.replace(N_ncaa_line[-10:-1], str(new_N_charge), 1)
+                    print(f'Updated N-termini charge: {new_N_charge}')
+
+                # Add NME charge to C
+                C_ncaa_line = mol2[start + 15]
+                C_ncaa = list(filter(None, C_ncaa_line.replace('\n', '').split(' ')))
+                if C_ncaa[1] == 'C':
+                    new_C_charge = round(float(C_ncaa_line[-9:-1]) + nme_cap, 6)
+                    mol2[start + 15] = C_ncaa_line.replace(C_ncaa_line[-9:-1], str(new_C_charge), 1)
+                    print(f'Updated C-termini charge: {new_C_charge}')
+
+                f_mol2.seek(0)
+                f_mol2.writelines(mol2)
+                f_mol2.truncate()
+
+
+# ============================================================================
+# MOL2 File Processing
+# ============================================================================
+
+def process_mol2_file(file_path):
+    """Fix atom types in MOL2 file (DU/N3 -> N for nitrogen)."""
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
+    for i in range(len(lines)):
+        line = lines[i]
+        if len(line) >= 52 and (line[50:52] == "DU" or line[50:52] == "N3"):
+            if "N" in line[8:10]:
+                lines[i] = line[:50] + "N " + line[52:]
+
+    with open(file_path, 'w') as f:
+        f.writelines(lines)
+
+
+def process_mol2_with_args(mol2_value, resp_folder='RESP'):
+    """Process MOL2 file with given residue name."""
+    file_name = f"{mol2_value}_1.mol2"
+    file_path = os.path.join(resp_folder, file_name)
+    process_mol2_file(file_path)
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+
+def main(input_file, names_list, cut_off, optimization_method='gaussian'):
+    """Main prepff pipeline."""
+    global c_value, v_value
+
+    # Step 1: Analyze rotatable bonds
+    results = count_rotatable_bonds(input_file, cut_off)
+    for smiles, num_rotatable_bonds, c_val, v_val in results:
+        print(f"SMILES: {smiles}  Rotatable bonds: {num_rotatable_bonds}  "
+              f"c_value: {c_val}  v_value: {v_val}")
+        c_value, v_value = c_val, v_val
+
+    n_value = names_list[0]
+    combined_file = 'combined_pdb_files.pdb'
+
+    # Step 2: Generate capped SMILES and conformers
+    print("\n=== Generating conformers ===")
+    processed_smiles_list = gen_smiles(input_file, names_list)
+
+    for i in range(c_value):
+        print(f"Running iteration {i + 1}...")
+        gen_conformers(processed_smiles_list, names_list)
+
+        for pdb_file in os.listdir('pdb_files'):
+            if pdb_file.endswith('.pdb'):
+                pdb_filepath = os.path.join('pdb_files', pdb_file)
+                append_pdb_to_combined_file(pdb_filepath, combined_file)
+
+    # Step 3: Split and sort PDB files
+    print("\n=== Processing PDB files ===")
+    combined_pdb_file = 'combined_pdb_files.pdb'
+    output_directory = 'split_pdb_files'
+
+    try:
+        sorted_combined_file = split_combined_pdb(combined_pdb_file, output_directory, n_value)
+        print(f"Created sorted combined PDB file: {sorted_combined_file}")
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+
+    # Step 4: Prepare directories
+    required_dirs = ['pdb_files', 'PDB_rearranged', 'GJF', 'mol', 'RESP']
+    gjf_folder = 'GJF'
+    resp_folder = 'RESP'
+
+    for dir_name in required_dirs:
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name)
+            print(f"Created directory: {dir_name}")
+
+    # Step 5: Calculate system charge
+    system_charge = calculate_system_charge(input_file)
+    print(f"\nSystem charge: {system_charge}")
+
+    # Step 6: Extract first conformer for QM
+    input_pdb = 'combined_sorted_pdb_files.pdb'
+    output_pdb_dir = 'PDB_rearranged'
+    output_pdb = os.path.join(output_pdb_dir, f'{n_value}_1.pdb')
+
+    os.makedirs(output_pdb_dir, exist_ok=True)
+
+    with open(input_pdb, 'r') as infile:
+        with open(output_pdb, 'w') as outfile:
+            for line in infile:
+                if line.strip() == 'END':
+                    outfile.write('END\n')
+                    break
+                outfile.write(line)
+
+    print(f"First conformer saved to {output_pdb}")
+
+    # Step 7: Adjust dihedrals
+    adjusted_pdb_files = [os.path.join(output_pdb_dir, f'{name}_{i+1}.pdb')
+                          for i, name in enumerate(names_list)]
+    adjust_dihedrals_in_pdb_files(adjusted_pdb_files)
+
+    # Step 8: Remove CONECT lines
+    for pdb_file in os.listdir(output_pdb_dir):
+        if pdb_file.endswith(".pdb"):
+            pdb_filepath = os.path.join(output_pdb_dir, pdb_file)
+            remove_conect_lines_from_pdb(pdb_filepath)
+
+    # Step 9: Generate Gaussian input
+    if optimization_method == 'gaussian':
+        print("\n=== Running Gaussian optimization ===")
+        gaussian_input_dir = 'GJF'
+        generate_gaussian_input(adjusted_pdb_files, gaussian_input_dir, system_charge)
+
+        # Wait for Gaussian jobs to complete
+        print("Waiting for Gaussian jobs to complete...")
+        all_jobs_completed = False
+        while not all_jobs_completed:
+            all_jobs_completed = True
+            for log_file in os.listdir(gaussian_input_dir):
+                if log_file.endswith('.log'):
+                    log_filepath = os.path.join(gaussian_input_dir, log_file)
+                    if not is_gaussian_job_completed(log_filepath):
+                        all_jobs_completed = False
+                        break
+            if not all_jobs_completed:
+                time.sleep(60)
+
+    # Step 10: Process log files and generate MOL
+    print("\n=== Generating MOL files ===")
+    process_log_files(input_file, gjf_folder)
+
+    # Step 11: Generate RESP files
+    print("\n=== Running RESP charge calculation ===")
+    if not os.path.exists(resp_folder):
+        os.makedirs(resp_folder)
+
+    for filename in os.listdir(gjf_folder):
+        if filename.endswith('.log'):
+            res = os.path.splitext(filename)[0]
+            resp = os.path.join(resp_folder, res)
+
+            shutil.copyfile(os.path.join(gjf_folder, filename), f'{res}.log')
+            generate_resp_input(res, resp)
+            run_resp_calculation(res, resp)
+            shutil.move(f'{res}.log', os.path.join(resp_folder, f'{res}.log'))
+
+    # Step 12: Adjust atom types and cap charges
+    print("\n=== Finalizing MOL2 files ===")
+    atom_type_adjust(resp_folder)
+    calculate_capcharge(resp_folder)
+    process_mol2_with_args(n_value, resp_folder)
+
+    print("\n=== prepff completed successfully ===")
+    print(f"Output files:")
+    print(f"  - {resp_folder}/{n_value}_1.mol2")
+    print(f"  - mol/{n_value}_opt.mol")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='PrepFF - Prepare intermediate files for NCAA parameterization',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    prepff -i input.smiles -n 03S
+    prepff -i input.smiles -n 03S -m gaussian
+    prepff -i input.smiles -n 03S -c 50
+        """)
+    parser.add_argument('-i', '--input', required=True,
+                        help='Path to input SMILES file')
+    parser.add_argument('-n', '--names', required=True, nargs='+',
+                        help='Residue name(s) for NCAA (e.g., 03S)')
+    parser.add_argument('-c', '--cut_off', type=int, default=10000,
+                        help='Cutoff for conformer generation (default: 10000)')
+    parser.add_argument('-m', '--method', choices=['gaussian', 'aimnet'],
+                        default='gaussian', help='Optimization method (default: gaussian)')
+
+    args = parser.parse_args()
+    main(args.input, args.names, args.cut_off, args.method)
