@@ -1,47 +1,137 @@
 # RotSwing
-A protein modeling and sampling method for non canonical amino acids, post-translational modifications, and covalent modifications
 
-## Dependence
-This script is tested under Python 3.8.18.
-Also, Python 2.7.17 is required to run Rosetta related scripts.
-Other software and libraries that need to be installed:
-- numpy 1.24.4
-- scipy 1.10.1
-- rdkit 2024.03.5
-- biopython 1.83
-- aimnet
-- torch 2.3.1
-- cudatoolkit 11.3.1
-- ase 3.23.0
-- dftd4 3.6.0
-- dftd4-python 3.6.0
+A modular pipeline for parameterizing **Non-Canonical Amino Acids (NCAAs)** for Rosetta molecular modeling and GROMACS molecular dynamics simulations.
+
+## Architecture
+
+The pipeline consists of three stages plus a master wrapper:
+
+| Script | Stage | Input | Output |
+|--------|-------|-------|--------|
+| `prepff` | 1 | SMILES | MOL2, MOL, PDB |
+| `paramsgen` | 2 | MOL, MOL2 | .params, rotamer PDB |
+| `topolgen` | 3 | MOL2 | .top, .gro, .rtp |
+| `rotswing` | all | SMILES | all of the above |
+
+## Dependencies
+
+Tested under Python 3.8.18. Python 2.7.17 is required for Rosetta's `molfile_to_params_polymer.py`.
+
+Core Python packages:
+- numpy, scipy, rdkit, biopython, pytest
+
+Optional (path-dependent):
+- **Gaussian 16** — DFT optimization and RESP charges (Gaussian path)
+- **AIMNet + PyTorch + CUDA** — neural network optimization (AIMNet path, fast)
+- **AmberTools + acpype** — GROMACS topology generation (Stage 3)
+- **Open Babel** — format conversion, 3D structure generation
+- **dftd4** — dispersion energy for conformer screening
+
+```bash
+# Recommended install
+conda install -c conda-forge openbabel ambertools=22 acpype dftd4
+pip install torch==1.12.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
 ```
-    conda install cudatoolkit=11.3 cudnn
-    pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113
-    conda install conda-forge::openbabel
-    conda install ambertools=22 acpype dftd4
+
+## Quick Start
+
+```bash
+# Three-stage workflow for a single NCAA
+
+# Stage 1: Generate intermediate files (SMILES → MOL2/PDB)
+./scripts/prepff -i input.smiles -n XXX
+
+# Stage 2: Generate Rosetta params files
+./scripts/paramsgen -n XXX
+
+# Stage 3: Generate GROMACS topology files
+./scripts/topolgen -n XXX
+
+# Or run everything in one command:
+./scripts/rotswing -i input.smiles -n XXX
 ```
+
 ## Input
-An **input.smiles** file which contains SMILES format test of your molecule is required, the content is similar to the following form:
 
-`N[C@H](C(O)=O)CC1=C(C(F)=C(C(F)=C1F)F)F`
+An `input.smiles` file containing one SMILES string per NCAA:
 
-Note: If you want to process multiple SMILES at once, you can separate them with line breaks. And there should be no empty lines at the beginning, end, or middle of the file. At the same time, you need to ensure that the number of NCAA three letter abbreviations entered in **-n** command matches the number of SMILES that are entered. Although this is feasible, it is **<font color=red>not recommended</font>** to add multiple smiles at once in input.smiles, as this may cause errors during runtime
-## Run
-In order to generate Rosetta and Gromacs parameters, you can refer to the following steps:
-1. Create a specific folder for your NCAA
-2. Place the **script** and **input.smiles** file into this folder
-3. Enter the following command to run the script
 ```
-cd ~/YOUR_NCAA_FOLDER
-python Param_Rotamer.py -i input.smiles -n UAA
+N[C@H](C(O)=O)CC1=C(C(F)=C(C(F)=C1F)F)F
 ```
-Required:
--i: your NCAA's SMILES
--n: your NCAA's three letter abbreviation
 
-Optional:
--c: whether or not delete intermediate files, accept 0 or 1 as its parameter. 0 stands for 'do not delete', 1 stands for 'delete'. Default delete
--d: RMSD_threshold, which is used to determine which conformations will be retained. It is recommended to choose a value between **0.1 and 1**. A larger RMSD_threshold will result in greater differences between conformations in the library, higher sparsity, and fewer conformations. 
+Multiple SMILES can be processed at once (separated by newlines), but the number of NCAA three-letter codes (`-n`) must match.
+
+## Options
+
+### prepff (Stage 1)
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i` | Input SMILES file | required |
+| `-n` | Three-letter NCAA code | required |
+| `-c` | Conformer generation cutoff | 10000 |
+| `-m` | Optimization method: `gaussian` or `aimnet` | gaussian |
+
+### paramsgen (Stage 2)
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-n` | Three-letter NCAA code | required |
+| `-r` | RMSD threshold (0.001 = auto-adaptive) | 0.001 |
+| `-e` | Energy cutoff in kcal/mol for dftd4 screening | none |
+| `-c` | Clean temporary files | false |
+
+### topolgen (Stage 3)
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-n` | Three-letter NCAA code | required |
+| `--resp_folder` | Custom RESP output folder | RESP |
+
+### rotswing (all stages)
+Accepts all options above plus:
+| Flag | Description |
+|------|-------------|
+| `--stage STAGE` | Run single stage: `prepff`, `paramsgen`, `topolgen`, or `all` |
+| `--dry-run` | Print commands without executing |
+| `--clean` | Clean temporary files |
+
+## Two Optimization Paths
+
+### Gaussian Path (`-m gaussian`, default)
+High accuracy, slow (2-6 hours). DFT optimization at B3LYP/6-311+g(d,p) level with RESP charge fitting.
+
+### AIMNet Path (`-m aimnet`)
+Fast (5-15 minutes), requires GPU. Neural network optimization with Gasteiger charges. Good for rapid screening.
+
+| Step | Gaussian | AIMNet |
+|------|----------|--------|
+| Conformer Gen | 5-15 min | 5-15 min |
+| Optimization | 2-6 hours | 5-15 min |
+| Charge Fitting | 0.5-2 hours | < 1 min |
+| **Total** | **2-6 hours** | **5-15 min** |
+
 ## Output
-You will find your Rosetta parameter file **UAA.params**, Rotamer library file **merged_combined_pdb_files.pdb**, and Gromacs parameter files in the current folder
+
+- `XXX.params` — Rosetta parameter file
+- `XXX.rtp` — GROMACS residue topology for pdb2gmx
+- `XXX_gromacs_prm/XXX.top` — GROMACS topology
+- `XXX_gromacs_prm/XXX.gro` — GROMACS coordinates
+- `merged_combined_pdb_files.pdb` — Rotamer library
+
+## Testing
+
+```bash
+# Run all 62 tests
+python -m pytest test/ -v
+
+# Run per stage
+python -m pytest test/test_prepff.py -v     # 20 tests
+python -m pytest test/test_paramsgen.py -v  # 32 tests
+python -m pytest test/test_topolgen.py -v   # 10 tests
+```
+
+Tests run without external dependencies (no Gaussian, AIMNet, AmberTools, or dftd4 needed).
+
+## References
+
+- [CLAUDE.md](CLAUDE.md) — Detailed technical documentation
+- [ALGORITHM.md](ALGORITHM.md) — Algorithm descriptions
+- [USAGE.md](USAGE.md) — Extended usage guide

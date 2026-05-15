@@ -22,11 +22,15 @@ Output:
 import os
 import argparse
 import re
+import json
 import numpy as np
 import subprocess
 import math
 from Bio import PDB
 from Bio.PDB import PDBParser, PDBIO, Superimposer
+
+# State file path (shared with prepff)
+STATE_FILE = '.prepff_state.json'
 
 
 # ============================================================================
@@ -375,7 +379,7 @@ def kabsch_algorithm(P, Q):
     P_centered = P - np.mean(P, axis=0)
     Q_centered = Q - np.mean(Q, axis=0)
 
-    H = np.dot(P_centered.T, Q_centered)
+    H = np.dot(Q_centered.T, P_centered)
     U, S, Vt = np.linalg.svd(H)
     V = Vt.T
     d = np.sign(np.linalg.det(np.dot(V, U.T)))
@@ -903,11 +907,118 @@ def delete_temp_files():
 
 
 # ============================================================================
+# Pipeline State
+# ============================================================================
+
+def read_pipeline_state():
+    """Read pipeline state saved by prepff, or return safe defaults."""
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def get_adaptive_rmsd_threshold(v_value, user_threshold):
+    """Compute adaptive RMSD threshold based on conformer complexity (v_value).
+
+    If user provides a non-default threshold, use it directly.
+    Otherwise, derive threshold from v_value using the standard mapping.
+    """
+    if user_threshold != 0.001:
+        return user_threshold
+
+    thresholds = {10: 0.80, 30: 0.60, 90: 0.40, 270: 0.20, 810: 0.10}
+    return thresholds.get(v_value, 0.01)
+
+
+# ============================================================================
+# Energy Screening (dftd4-based)
+# ============================================================================
+
+def extract_energy_from_pdb_remark(pdb_filepath):
+    """Extract energy (kcal/mol) from PDB REMARK line."""
+    with open(pdb_filepath, 'r') as f:
+        for line in f:
+            if line.startswith("REMARK Energy after optimization:"):
+                match = re.search(r'[-+]?\d*\.?\d+', line)
+                if match:
+                    return float(match.group())
+    return None
+
+
+def screen_by_energy(input_pdb, output_pdb=None, energy_cutoff=10.0):
+    """Filter conformers by relative energy (keeping those within cutoff of minimum).
+
+    Reads energy from PDB REMARK lines. Conformers with energy > min_energy + cutoff
+    are discarded.
+    """
+    if output_pdb is None:
+        output_pdb = input_pdb + '.energy_screened'
+
+    # Parse conformers and their energies
+    with open(input_pdb, 'r') as f:
+        content = f.read().strip().split('END\n')
+
+    conformers = []
+    for block in content:
+        if block.strip():
+            pdb_block = block.strip() + '\nEND'
+            # Try to extract energy
+            energy = None
+            for line in pdb_block.splitlines():
+                if "REMARK Energy after optimization:" in line:
+                    match = re.search(r'[-+]?\d*\.?\d+', line)
+                    if match:
+                        energy = float(match.group())
+                    break
+            conformers.append((pdb_block, energy))
+
+    # If no energy data, skip screening
+    has_energy = any(e is not None for _, e in conformers)
+    if not has_energy:
+        print("No energy data found in PDB files. Skipping energy screening.")
+        return input_pdb
+
+    # Find minimum energy
+    valid_energies = [e for _, e in conformers if e is not None]
+    if not valid_energies:
+        print("No valid energy values found. Skipping energy screening.")
+        return input_pdb
+
+    min_energy = min(valid_energies)
+    print(f"Minimum energy among conformers: {min_energy:.2f} kcal/mol")
+
+    # Filter by energy cutoff
+    kept = []
+    discarded = 0
+    for pdb_block, energy in conformers:
+        if energy is None or (energy - min_energy) <= energy_cutoff:
+            kept.append(pdb_block)
+        else:
+            discarded += 1
+
+    print(f"Energy screening: kept {len(kept)}, discarded {discarded} "
+          f"(cutoff: {energy_cutoff} kcal/mol above minimum)")
+
+    # Write filtered output
+    with open(output_pdb, 'w') as f:
+        for block in kept:
+            f.write(block + '\n')
+
+    return output_pdb
+
+
+# ============================================================================
 # Main Pipeline
 # ============================================================================
 
-def main(n_value, rmsd_threshold, clean=False):
+def main(n_value, rmsd_threshold, clean=False, energy_cutoff=None):
     """Main paramsgen pipeline."""
+
+    # Read state from prepff
+    state = read_pipeline_state()
+    v_value = state.get('v_value', 30)
+    print(f"Pipeline state: v_value={v_value}")
 
     # Step 1: Generate params files from MOL
     print("\n=== Generating Rosetta params files ===")
@@ -929,31 +1040,34 @@ def main(n_value, rmsd_threshold, clean=False):
     print("\n=== Processing charges ===")
     process_charges(n_value)
 
-    # Step 4: Determine RMSD threshold
-    # Get v_value from previous stage (stored in global or calculate from input)
-    # For now, use provided threshold or default
-    print(f"\nRMSD threshold: {rmsd_threshold}")
+    # Step 4: Compute adaptive RMSD threshold
+    rmsd_threshold = get_adaptive_rmsd_threshold(v_value, rmsd_threshold)
+    print(f"\nRMSD threshold: {rmsd_threshold} (v_value={v_value})")
 
-    # Step 5: RMSD screening
+    # Step 5: Energy screening (before RMSD, if energy data available)
+    combined_input = 'combined_sorted_pdb_files.pdb'
+    if energy_cutoff is not None and os.path.exists(combined_input):
+        print(f"\n=== Energy screening (cutoff: {energy_cutoff} kcal/mol) ===")
+        screen_by_energy(combined_input, combined_input, energy_cutoff)
+
+    # Step 6: RMSD screening
     print("\n=== RMSD screening ===")
-    # v_value would typically be passed from prepff; using default here
-    v_value = 30  # Default, should be read from prepff output
     screen_rmsd(rmsd_threshold, v_value)
 
-    # Step 6: Chi angle screening
+    # Step 7: Chi angle screening
     print("\n=== Chi angle screening ===")
     args_params = f'{n_value}_temps.params'
     chi_screen(args_params)
 
-    # Step 7: Merge unique conformers
+    # Step 8: Merge unique conformers
     print("\n=== Merging conformers ===")
     append_unique_conformers('Chi_screen.pdb', 'aligned_combined_pdb_files.pdb')
 
-    # Step 8: Process final rotamer PDB
+    # Step 9: Process final rotamer PDB
     print("\n=== Processing rotamer PDB ===")
     modify_rotamer_pdb(n_value)
 
-    # Step 9: Add PDB_ROTAMERS line to params
+    # Step 10: Add PDB_ROTAMERS line to params
     print("\n=== Finalizing params file ===")
     filename = f'{n_value}.params'
     with open(filename, 'r') as f:
@@ -994,8 +1108,12 @@ Examples:
                         help='RMSD threshold for conformer screening (default: 0.001, auto-adjusts based on complexity)')
     parser.add_argument('-c', '--clean', action='store_true',
                         help='Clean temporary files after completion')
+    parser.add_argument('-e', '--energy_cutoff', type=float, default=None,
+                        help='Energy cutoff in kcal/mol for dftd4-based screening (e.g., 10.0). '
+                             'Conformers above min_energy + cutoff are discarded. '
+                             'Only effective if PDB files contain energy data from prepff.')
     parser.add_argument('--resp_folder', default='RESP',
                         help='Path to RESP folder (default: RESP)')
 
     args = parser.parse_args()
-    main(args.name, args.rmsd_threshold, args.clean)
+    main(args.name, args.rmsd_threshold, args.clean, args.energy_cutoff)

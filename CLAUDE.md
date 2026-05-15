@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-RotSwing is a comprehensive system for parameterizing **Non-Canonical Amino Acids (NCAAs)** for molecular modeling and simulation. It bridges cheminformatics, quantum chemistry, and molecular mechanics to generate production-ready force field parameters.
+RotSwing is a modular pipeline for parameterizing **Non-Canonical Amino Acids (NCAAs)** for molecular modeling and simulation (Rosetta) and molecular dynamics (GROMACS). It bridges cheminformatics, quantum chemistry, and molecular mechanics.
 
 ## Quick Start
 
@@ -17,92 +17,125 @@ RotSwing is a comprehensive system for parameterizing **Non-Canonical Amino Acid
 
 # Stage 3: Generate GROMACS topology files
 ./scripts/topolgen -n XXX
+
+# Or run everything in one command:
+./scripts/rotswing -i input.smiles -n XXX
 ```
 
 ---
 
 ## Script Architecture
 
-The parameterization pipeline is split into three modular scripts:
+The pipeline consists of four scripts. Three stage scripts plus a master wrapper:
+
+| Script | Stage | Input | Output |
+|--------|-------|-------|--------|
+| `prepff` | 1 | SMILES | MOL2, MOL, PDB |
+| `paramsgen` | 2 | MOL, MOL2 | .params, rotamer PDB |
+| `topolgen` | 3 | MOL2 | .top, .gro, .rtp |
+| `rotswing` | all | SMILES | all of the above |
+
+Stage scripts communicate via the filesystem. `prepff` writes a `.prepff_state.json` state file that `paramsgen` reads to get `v_value` (conformer count threshold) and other parameters.
+
+**Deprecated scripts (deleted):** `Param_Rotamer.py`, `Param_Rotamer-after_opt.py`, `R_G_parameterize.py`. All their functionality has been absorbed into the modular pipeline above.
+
+---
 
 ### 1. prepff - Prepare Force Field Intermediate Files
 
-**Purpose**: Generate intermediate files from input SMILES
-
-**Functions**:
-- SMILES parsing and validation
-- Terminal capping (ACE/NME)
-- Conformer generation (RDKit ETKDG)
-- Structure optimization (Gaussian/AIMNet)
-- RESP charge calculation
-- Atom type assignment
-- Cap charge redistribution
-
-**Input**:
-- `input.smiles` - SMILES string(s)
-
-**Output**:
-- `RESP/XXX_1.mol2` - MOL2 with RESP charges
-- `mol/XXX_opt.mol` - MOL file for Rosetta
-- `PDB_rearranged/` - Processed PDB files
-
-**Usage**:
+**Usage:**
 ```bash
 prepff -i input.smiles -n XXX [-c cutoff] [-m gaussian|aimnet]
 ```
+
+**Two optimization paths:**
+
+#### Gaussian path (`-m gaussian`, default)
+- SMILES → capping (ACE/NME) → conformer generation (RDKit ETKDG) → Gaussian DFT optimization (B3LYP/6-311+g(d,p)) → RESP charge fitting → MOL2 with RESP charges
+- Produces high-accuracy charges but slow (hours)
+
+#### AIMNet path (`-m aimnet`)
+- SMILES → obabel 3D generation → UFF pre-optimization → AIMNet neural network optimization (gas phase 50 steps + solvent phase 499 steps, ASE BFGS with backbone dihedral constraints) → MOL2 with Gasteiger charges
+- Fast (minutes), GPU required. No RESP charges — uses Gasteiger instead. Good for rapid screening.
+
+**Conformer generation details:**
+- Number of conformers (`c_value`, `v_value`) determined by rotatable bond count
+- If dftd4 is available, each conformer gets dispersion energy calculated and stored in PDB REMARK
+- Steric clash detection filters bad conformers (atoms < 0.6 Å apart)
+- Conformers sorted by energy, first (lowest) used for QM optimization
+
+**Output:**
+- `RESP/XXX_1.mol2` — MOL2 with charges
+- `mol/XXX_opt.mol` — MOL file with Rosetta polymer info
+- `combined_sorted_pdb_files.pdb` — All conformers sorted by energy (input for paramsgen screening)
+- `.prepff_state.json` — Pipeline state (v_value, c_value, etc.) for downstream scripts
 
 ---
 
 ### 2. paramsgen - Generate Rosetta Parameter Files
 
-**Purpose**: Create `.params` files for Rosetta from intermediate files
-
-**Functions**:
-- Convert MOL to params (molfile_to_params_polymer.py)
-- ICOOR parameter calculation and update
-- Charge refinement (round to integers)
-- RMSD-based conformer screening
-- Chi angle diversity screening
-- Rotamer library PDB generation
-
-**Input**:
-- `mol/XXX_opt.mol` - from prepff
-- `RESP/XXX_1.mol2` - from prepff
-
-**Output**:
-- `XXX.params` - Rosetta parameter file
-- `XXX_temps.params` - Template params (for charge transfer)
-- `merged_combined_pdb_files.pdb` - Rotamer library
-
-**Usage**:
+**Usage:**
 ```bash
-paramsgen -n XXX [-r rmsd_threshold] [-c]
+paramsgen -n XXX [-r rmsd_threshold] [-e energy_cutoff] [-c]
 ```
+
+**Screening pipeline (executed in order):**
+
+1. **Energy screening** (`-e` flag): Discards conformers above `min_energy + cutoff` kcal/mol. Only works if PDB files contain energy data from `prepff` (requires dftd4).
+2. **RMSD screening** (`-r` flag): Removes conformers with side-chain RMSD below threshold. Threshold auto-adapts based on `v_value` from prepff state: v=10→0.80Å, v=30→0.60Å, v=90→0.40Å, v=270→0.20Å, v=810→0.10Å. If user provides explicit threshold, that overrides the adaptive value.
+3. **Chi angle screening**: Ensures diversity of side-chain dihedral angles (minimum 15° separation).
+4. **Merge**: Combines RMSD-screened and Chi-screened sets, deduplicating by RMSD.
+
+**After screening:**
+- Generates Rosetta `.params` files via `molfile_to_params_polymer.py` (Python 2)
+- Updates ICOOR parameters from MOL2 coordinates
+- Adjusts charges to integer totals
+- Adds `PDB_ROTAMERS` line referencing the rotamer library PDB
+
+**Output:**
+- `XXX.params` — Rosetta parameter file
+- `XXX_temps.params` — Template (used for charge transfer)
+- `merged_combined_pdb_files.pdb` — Rotamer library
 
 ---
 
 ### 3. topolgen - Generate GROMACS Topology Files
 
-**Purpose**: Create `.top` and `.rtp` files for GROMACS
-
-**Functions**:
-- AmberTools parmchk2 for missing parameters
-- tleap for Amber topology generation
-- acpype for GROMACS conversion
-- RTP file generation (residue template)
-
-**Input**:
-- `RESP/XXX_1.mol2` - from prepff
-
-**Output**:
-- `XXX_gromacs_prm/XXX.top` - GROMACS topology
-- `XXX_gromacs_prm/XXX.gro` - GROMACS coordinates
-- `XXX.rtp` - Residue topology file
-
-**Usage**:
+**Usage:**
 ```bash
 topolgen -n XXX [--resp_folder RESP]
 ```
+
+**Workflow:**
+- `parmchk2` → missing parameter file (.mod)
+- `tleap` → Amber topology (.prm, .crd)
+- `acpype` → GROMACS conversion (.top, .gro)
+- RTP generation from topology (excludes ACE/NME cap atoms, adds backbone connectivity bonds)
+
+**Output:**
+- `XXX_gromacs_prm/XXX.top` — GROMACS topology
+- `XXX_gromacs_prm/XXX.gro` — GROMACS coordinates
+- `XXX.rtp` — Residue topology file for pdb2gmx
+
+---
+
+### 4. rotswing - Master Pipeline Wrapper
+
+**Usage:**
+```bash
+rotswing -i input.smiles -n XXX [options]
+
+# Options from all stages:
+#   -c CUT_OFF     Conformer generation cutoff (default: 10000)
+#   -m METHOD      Optimization method: gaussian|aimnet (default: gaussian)
+#   -r THRESHOLD   RMSD threshold (default: 0.001 = auto-adaptive)
+#   -e CUTOFF      Energy cutoff in kcal/mol for dftd4 screening
+#   --clean        Clean temporary files
+#   --stage STAGE  Run single stage: prepff|paramsgen|topolgen|all
+#   --dry-run      Print commands without executing
+```
+
+Runs `prepff → paramsgen → topolgen` in sequence, passing parameters through.
 
 ---
 
@@ -111,395 +144,165 @@ topolgen -n XXX [--resp_folder RESP]
 ```
 input.smiles
      ↓
-[prepff] → ACE/XXX/NME capping
+[prepff]
+  ├─ Capping (ACE/NME)
+  ├─ Conformer generation (RDKit + dftd4 energy)
+  ├─ QM Optimization (Gaussian or AIMNet)
+  ├─ RESP or Gasteiger charges → MOL2
+  └─ MOL generation + polymer info
      ↓
-Conformer generation (RDKit)
+.prepff_state.json  ←── v_value, c_value, etc.
      ↓
-QM Optimization (Gaussian/AIMNet)
+[paramsgen]
+  ├─ Params file generation (molfile_to_params_polymer.py)
+  ├─ ICOOR update
+  ├─ Charge refinement
+  ├─ Energy screening (optional, dftd4-based)
+  ├─ RMSD screening (adaptive threshold)
+  ├─ Chi angle screening
+  └─ Rotamer library (.pdb)
      ↓
-RESP Charge fitting
+[topolgen]
+  ├─ AmberTools (parmchk2, tleap)
+  ├─ acpype (GROMACS conversion)
+  └─ RTP generation
      ↓
-┌─────────────┬─────────────┐
-↓             ↓             ↓
-[paramsgen]  [topolgen]    (intermediate)
-     ↓             ↓
-XXX.params   XXX_gromacs_prm/
-(Rosetta)    XXX.top
-             XXX.rtp
-             (GROMACS)
+Output: .params + .top + .rtp + rotamer PDB
 ```
 
 ---
 
-### 1. Input Processing
+## Pipeline State File
 
-**Purpose**: Accept and validate non-natural amino acid descriptions
+`prepff` writes `.prepff_state.json` with:
 
-**Requirements**:
-- Parse SMILES strings representing amino acid structures
-- Support standard and non-standard amino acid backbones
-- Validate chemical structure correctness
-- Handle stereochemistry (R/S, D/L configurations)
-
-**Inputs**:
-- SMILES notation (e.g., `CC(C)C[C@H](N)C(=O)O`)
-- Residue names/identifiers
-- Optional: existing 3D structures (PDB, MOL)
-
-**Outputs**:
-- Validated molecular structure objects
-- Standardized atom naming conventions
-
----
-
-### 2. Terminal Capping
-
-**Purpose**: Block amino acid termini to create realistic peptide environment
-
-**Requirements**:
-- Automatically add ACE (acetyl, CH3-CO-) cap at N-terminus
-- Automatically add NME (N-methyl amide, -NH-CH3) cap at C-terminus
-- Maintain proper bond connectivity and geometry
-- Preserve stereochemistry during capping
-
-**Why Capping Matters**:
-- Prevents artificial charge effects at termini
-- Mimics actual peptide chain environment
-- Required for accurate RESP charge calculation
-- Standard practice in force field development
-
----
-
-### 3. Conformer Generation
-
-**Purpose**: Generate diverse 3D conformations for side-chain flexibility
-
-**Requirements**:
-- Generate multiple conformers based on rotatable bond count
-- Use systematic approach to sample chi angles (side-chain dihedrals)
-- Ensure conformer diversity (geometric coverage)
-- Avoid atomic clashes (steric hindrance)
-
-**Algorithms**:
-- Distance geometry (RDKit ETKDG)
-- Random/ systematic dihedral variation
-- RMSD-based diversity filtering
-- Energy-based filtering (DFTD4 for dispersion correction)
-
-**Configuration**:
-```
-Rotatable Bonds  →  Min Conformers
-1-2              →  50
-3-4              →  100
-5+               →  200
+```json
+{
+  "v_value": 30,
+  "c_value": 10000,
+  "n_value": "03S",
+  "names": ["03S"],
+  "optimization_method": "gaussian",
+  "num_rotatable_bonds": 3,
+  "rmsd_thresholds": {"10": 0.80, "30": 0.60, "90": 0.40, "270": 0.20, "810": 0.10}
+}
 ```
 
----
-
-### 4. Structure Optimization
-
-**Purpose**: Refine 3D structures to energy minima
-
-**Two Implementation Paths**:
-
-#### Path A: Quantum Chemistry (Gaussian)
-- **Method**: DFT (Density Functional Theory)
-- **Functionals**: B3LYP
-- **Basis Sets**: 6-311+g(d,p) or LANL2DZ (for heavy atoms)
-- **Settings**: Tight convergence, ultrafine integration grid
-- **Pros**: High accuracy, established method
-- **Cons**: Computationally expensive (hours per molecule)
-
-#### Path B: Neural Network (AIMNet)
-- **Method**: Machine learning potential
-- **Models**: AIMNet-MT (gas phase), AIMNet-SMD (solution phase)
-- **Acceleration**: GPU (CUDA)
-- **Pros**: Fast (minutes), reasonable accuracy
-- **Cons**: Less accurate than DFT, GPU-dependent
-
-**Optimization Criteria**:
-- Force convergence < 0.0001 Hartree/Bohr
-- Displacement convergence < 0.0001 Bohr
-- Maximum iterations: 100-200
+`paramsgen` reads this to get `v_value` for adaptive RMSD threshold selection.
 
 ---
 
-### 5. Conformer Screening
+## Technical Details
 
-**Purpose**: Select representative conformers for parameterization
+### Terminal Capping
 
-**Multi-Level Screening**:
+ACE (acetyl, CH3-CO-) at N-terminus, NME (N-methyl amide, -NH-CH3) at C-terminus. Applied via SMARTS reaction transforms to the raw SMILES before any 3D operations.
 
-1. **RMSD Screening** (Geometric Diversity)
-   - Remove conformers with RMSD < threshold to existing set
-   - Default threshold: 0.5-1.0 Å
-   - Keeps geometrically distinct conformations
+### Conformer Generation Parameters
 
-2. **Chi Angle Screening** (Rotamer Diversity)
-   - Calculate all side-chain dihedral angles (chi1, chi2, chi3, chi4)
-   - Bin conformers by chi angle regions
-   - Ensure coverage of all rotameric states (gauche+, gauche-, trans)
-   - Minimum angular separation: 30°
+| Rotatable Bonds | v_value (target conformers) | c_value (max iterations) | Adaptive RMSD Threshold |
+|-----------------|-----------------------------|--------------------------|-------------------------|
+| 2 | 10 | 10,000 | 0.80 Å |
+| 3 | 30 | 10,000 | 0.60 Å |
+| 4 | 90 | 10,000 | 0.40 Å |
+| 5 | 270 | 10,000 | 0.20 Å |
+| 6+ | 810 | 10,000 | 0.10 Å |
 
-3. **Energy Screening** (Thermodynamic Feasibility)
-   - Calculate single-point energies
-   - Discard high-energy conformers (>10 kcal/mol above minimum)
-   - Boltzmann weighting for population analysis
+### AIMNet Optimization Details
 
----
+1. Initial 3D structure from obabel `--gen3D` (more stable than RDKit ETKDG for some scaffolds)
+2. UFF force field pre-optimization
+3. Backbone dihedral constraints: Phi=-150°, Psi=150° (or Phi=-120°, Psi=90° for peptoids)
+4. Gas phase optimization: AIMNet-MT ensemble, BFGS, max 50 steps, fmax=0.001
+5. Solvent phase optimization: AIMNet-SMD ensemble, BFGS, max 499 steps, fmax=0.001
+6. PDB output with RDKit-compatible atom naming
 
-### 6. RESP Charge Calculation
+### RESP Charge Calculation (Gaussian path only)
 
-**Purpose**: Derive accurate atomic partial charges
+Two-stage restrained electrostatic potential fitting:
+1. HF/6-31G* single point with MK population analysis
+2. Two-stage RESP fit: unrestrained then hyperbolic restraint (0.001 a.u.)
 
-**Methodology**:
-- **RESP**: Restrained ElectroStatic Potential
-- Two-stage fitting:
-  1. Unrestrained fit to ESP (Electrostatic Potential)
-  2. Restrained fit with hyperbolic restraint (0.001 a.u.)
+AIMNet path uses Gasteiger charges via antechamber `-c gas` as a fast alternative.
 
-**Procedure**:
-1. Calculate electrostatic potential grid (Gaussian)
-2. Fit charges to reproduce ESP at grid points
-3. Apply restraints to reduce overfitting
-4. Constrain cap atoms to standard values
-5. Scale charges to reproduce molecular dipole
+### Cap Charge Redistribution
 
-**Output**:
-- Partial atomic charges (RESP2 for aliphatic, RESP1 for polar)
-- Charge equivalence groups for chemically equivalent atoms
+Total charges of ACE and NME cap groups are calculated and redistributed to the N-terminal N and C-terminal C atoms of the NCAA residue to maintain integer total charge.
+
+### Screening Order Matters
+
+Energy screening (optional) runs first and reduces the pool for subsequent RMSD screening. RMSD then Chi, and finally the two screened sets are merged. This ordering prioritizes thermodynamic accessibility (energy) over geometric diversity (RMSD) over rotamer diversity (Chi).
 
 ---
 
-### 7. Atom Typing
+## Dependencies
 
-**Purpose**: Assign force field atom types for molecular mechanics
-
-**Rosetta Atom Types**:
-- Backbone atoms: Nbb, CAbb, Cbb, OCbb
-- Side-chain types: based on chemical environment
-- Special types for aromatic, polar, charged groups
-
-**GAFF/AMBER Atom Types** (for GROMACS):
-- sp3 carbons (c3)
-- sp2 carbons (c2, ca for aromatic)
-- Oxygens (oh, o)
-- Nitrogens (n, n3, n4)
-- Hydrogens (h1, ha, hn)
-
-**Rules**:
-- Hybridization state
-- Number of attached atoms
-- Chemical environment (aromatic, polar, etc.)
-- Bond order patterns
+- **Python 3.6+** with numpy, scipy, rdkit, biopython, pytest
+- **Python 2.7** for Rosetta `molfile_to_params_polymer.py`
+- **Gaussian 16** (for Gaussian path)
+- **AIMNet + PyTorch + CUDA** (for AIMNet path)
+- **AmberTools** (tleap, parmchk2, antechamber)
+- **acpype** (Amber → GROMACS conversion)
+- **Open Babel** (obabel, format conversion)
+- **dftd4** (optional, for dispersion energy in conformer screening)
+- **Rosetta** (optional, for validation)
 
 ---
 
-### 8. Force Field Parameter Generation
+## Testing
 
-#### 8.1 Rosetta Parameters (.params file)
+Tests are in `test/` and use pytest. The pipeline scripts (`prepff`, `paramsgen`, `topolgen`) have no `.py` extension, so `conftest.py` uses `importlib.machinery.SourceFileLoader` to load them as modules.
 
-**Contents**:
-- Atom records: name, Rosetta type, MM type, charge, coordinates
-- Bond connectivity: ICOOR (internal coordinate) records
-- Properties: LJ radii, LJ depth, acceptor/donor flags
-- Polymer info: lower/upper connect atoms, NBR (neighbor) atom
-- Chi definitions: rotatable bonds
+```bash
+# Run all tests
+python -m pytest test/ -v
 
-**Special Handling**:
-- Backbone connectivity (N-CA-C)
-- Side-chain torsions (chi angles)
-- Terminal capping groups
-- Aromatic rings and planarity constraints
-
-#### 8.2 GROMACS Topology (.top file)
-
-**Sections**:
-- [ defaults ]: Force field defaults
-- [ atomtypes ]: Atom type definitions
-- [ moleculetype ]: Residue name and exclusions
-- [ atoms ]: Atom numbers, types, charges, masses
-- [ bonds ]: Bond parameters (lengths, force constants)
-- [ angles ]: Angle parameters
-- [ dihedrals ]: Proper and improper dihedral parameters
-
-#### 8.3 GROMACS RTP (.rtp file)
-
-**Purpose**: Residue template for pdb2gmx
-
-**Sections**:
-- [ bondedtypes ]: Bond/angle/dihedral type mapping
-- Residue entry: atoms, bonds, angles, dihedrals, impropers
-
----
-
-### 9. Cap Charge Adjustment
-
-**Purpose**: Neutralize terminal cap contributions
-
-**Procedure**:
-1. Calculate total charge of ACE and NME caps separately
-2. Distribute cap charge excess across main residue atoms
-3. Maintain integer total charge (usually 0 for zwitterion, ±1 for charged)
-4. Preserve chemical symmetry in charge redistribution
-
-**ACE Standard Charges**:
-- C (carbonyl): +0.6163
-- O (carbonyl): -0.5722
-- CH3 methyl: -0.3662 (distributed)
-
-**NME Standard Charges**:
-- N: -0.4632
-- H: +0.2772
-- C (carbonyl): +0.6163
-- O (carbonyl): -0.5722
-- CH3 methyl: -0.3662 (distributed)
-
----
-
-### 10. Validation and Quality Control
-
-**Checks**:
-- Total charge equals expected value (±0.01 e tolerance)
-- No atomic clashes (minimum distance > 1.2 Å)
-- Bond lengths within chemical norms
-- Improper dihedrals maintain chirality
-- Ring closure distances acceptable
-
-**Output Metrics**:
-- Number of rotatable bonds
-- Number of generated conformers
-- Number of screened conformers
-- RMSD between conformers
-- Energy spread (kcal/mol)
-
----
-
-## Data Flow Architecture
-
-```
-Input SMILES
-     ↓
-[Capping] → ACE + NCAA + NME
-     ↓
-[Conformer Generation] → N conformers
-     ↓
-[Optimization] → Gaussian OR AIMNet
-     ↓
-[Conformer Screening] → RMSD + Chi + Energy filters
-     ↓
-[RESP Calculation] → Atomic charges
-     ↓
-[Atom Typing] → Rosetta + GAFF types
-     ↓
-[Parameter Generation] → .params + .top + .rtp
-     ↓
-Output Files
+# Run tests for a specific stage
+python -m pytest test/test_prepff.py -v
+python -m pytest test/test_paramsgen.py -v
+python -m pytest test/test_topolgen.py -v
 ```
 
----
+**Test coverage (62 tests total):**
 
-## Configuration Parameters
+| Test file | Tests | Coverage |
+|-----------|-------|----------|
+| `test/test_prepff.py` | 20 | SMILES processing, charge calculation, rotatable bonds, energy extraction, clash detection, dihedral setting, pipeline state I/O, MOL2 processing |
+| `test/test_paramsgen.py` | 32 | Dihedral/angle geometry, Kabsch algorithm, RMSD, MOL2 reading, charge adjustment, conformer extraction, adaptive thresholds, chi comparison, energy/PBD parsing |
+| `test/test_topolgen.py` | 10 | RTP generation: file creation, sections, cap exclusion, backbone bonds/impropers, atom renumbering, error handling |
 
-### Conformer Generation
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `rmsd_threshold` | 0.5 Å | Minimum RMSD between conformers |
-| `chi_separation` | 30° | Minimum chi angle difference |
-| `max_conformers` | 200 | Upper limit for conformer count |
-| `energy_cutoff` | 10 kcal/mol | Maximum energy above minimum |
-
-### Gaussian Settings
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `functional` | B3LYP | DFT exchange-correlation functional |
-| `basis_set` | 6-311+g(d,p) | Gaussian basis set |
-| `solvent` | None | Solvent model (SMD, PCM, etc.) |
-| `maxcyc` | 200 | Maximum optimization cycles |
-
-### AIMNet Settings
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `device` | cuda | Computation device |
-| `fmax` | 0.001 | Force convergence threshold |
-| `steps` | 500 | Maximum optimization steps |
+Tests are designed to run without external dependencies (no Gaussian, AIMNet, AmberTools, or dftd4 required). They use temporary files and in-memory data.
 
 ---
 
-## Use Cases
+## Common Issues
 
-### Use Case 1: Drug Design
-**Scenario**: Incorporate unnatural amino acids into peptide therapeutics
-**Workflow**: Param_Rotamer.py with Gaussian for accurate charges
-**Output**: Rosetta params for docking/design, GROMACS topology for MD
-
-### Use Case 2: Enzyme Engineering
-**Scenario**: Model enzyme active sites with modified residues
-**Workflow**: R_G_parameterize.py for rapid screening of many variants
-**Output**: Fast parameterization for virtual screening
-
-### Use Case 3: Force Field Development
-**Scenario**: Build custom force field for specific chemical space
-**Workflow**: Param_Rotamer.py with careful RESP fitting
-**Output**: Validated parameters with complete documentation
-
----
-
-## Integration Points
-
-### External Software
-- **RDKit**: Cheminformatics toolkit (SMILES, conformers)
-- **Gaussian**: Quantum chemistry engine
-- **AIMNet**: Neural network potential
-- **Rosetta**: Protein modeling suite
-- **GROMACS**: Molecular dynamics engine
-- **DFTD4**: Dispersion correction
-
-### File Formats
-- **Input**: SMILES, SDF, MOL, PDB
-- **Intermediate**: XYZ, GJF, LOG, MOL2
-- **Output**: PARAMS, TOP, RTP, PDB
-
----
-
-## Error Handling
-
-### Common Issues
 1. **SMILES parsing failure** → Validate with RDKit, check stereochemistry
 2. **Gaussian convergence failure** → Check initial geometry, increase cycles
-3. **Clashing atoms** → Increase conformer generation, lower RMSD threshold
-4. **Charge imbalance** → Verify cap charge calculation, check atom typing
-5. **Missing parameters** → Add custom bond/angle parameters
-
-### Recovery Strategies
-- Fallback to different initial conformers
-- Manual geometry adjustment
-- Custom atom type assignment
-- Multi-step optimization (coarse → fine)
+3. **AIMNet not available** → Falls back to Gaussian automatically
+4. **dftd4 not found** → Conformer generation proceeds without energy annotation; energy screening in paramsgen will be skipped
+5. **Clashing atoms** → Auto-detected and filtered (threshold: 0.6 Å)
+6. **Charge imbalance** → Auto-corrected via `adjust_charges_to_integer()`
+7. **Kabsch RMSD incorrect** → Fixed 2026-05-15: `kabsch_algorithm()` had a transpose error in the cross-covariance matrix (`H = P.T @ Q` changed to `H = Q.T @ P`) for correct row-vector convention. The old code returned the transpose of the optimal rotation; affected `calculate_rmsd()` for non-identical point sets.
 
 ---
 
-## Performance Considerations
+## Performance
 
 | Step | Gaussian Path | AIMNet Path |
 |------|--------------|-------------|
-| Conformer Gen | Minutes | Minutes |
-| Optimization | Hours | Minutes |
-| RESP Fitting | Hours | N/A |
-| Total (1 residue) | 2-6 hours | 5-15 minutes |
-
-**Parallelization**:
-- Conformer generation: Embarrassingly parallel
-- Gaussian jobs: Can be distributed across cluster
-- AIMNet: GPU batch processing
+| Conformer Gen (with dftd4) | 5-15 min | 5-15 min |
+| Optimization | 2-6 hours | 5-15 min |
+| Charge Fitting | 0.5-2 hours | < 1 min (Gasteiger) |
+| **Total (1 residue)** | **2-6 hours** | **5-15 minutes** |
 
 ---
 
 ## Future Enhancements
 
-- [ ] Explicit solvent support (SMD, PCM)
+- [ ] Explicit solvent support (SMD, PCM) in RESP calculation
 - [ ] pKa prediction for titratable residues
-- [ ] Automated validation against QM benchmarks
-- [ ] Integration with open-source QC packages (Psi4, xTB)
-- [ ] Web interface for non-expert users
+- [ ] Integration with open-source QC packages (Psi4, xTB/GFN2-xTB)
+- [ ] Support for D-amino acids, peptoids, beta/gamma amino acids
 - [ ] Batch processing for libraries of NCAAs
+- [ ] YAML/TOML configuration file support

@@ -35,7 +35,7 @@ def run_prepff(input_file, names, cutoff, method):
     return result.returncode == 0
 
 
-def run_paramsgen(name, rmsd_threshold, clean):
+def run_paramsgen(name, rmsd_threshold, clean, energy_cutoff):
     """Run paramsgen stage."""
     print("\n" + "="*60)
     print("STAGE 2: paramsgen - Generating Rosetta params files")
@@ -49,6 +49,8 @@ def run_paramsgen(name, rmsd_threshold, clean):
 
     if clean:
         cmd.append('-c')
+    if energy_cutoff is not None:
+        cmd.extend(['-e', str(energy_cutoff)])
 
     result = subprocess.run(cmd)
     return result.returncode == 0
@@ -103,6 +105,8 @@ Stages:
     # paramsgen options
     parser.add_argument('-r', '--rmsd_threshold', type=float, default=0.001,
                         help='RMSD threshold (default: 0.001)')
+    parser.add_argument('-e', '--energy_cutoff', type=float, default=None,
+                        help='Energy cutoff in kcal/mol for dftd4 screening (default: no energy screening)')
     parser.add_argument('--clean', action='store_true',
                         help='Clean temporary files after completion')
 
@@ -139,9 +143,10 @@ Stages:
     if args.stage in ('paramsgen', 'all'):
         if args.dry_run:
             print(f"[DRY RUN] Would run: paramsgen -n {args.names[0]} -r {args.rmsd_threshold} "
-                  f"{'-c' if args.clean else ''}")
+                  f"{'-c' if args.clean else ''} "
+                  f"{'-e ' + str(args.energy_cutoff) if args.energy_cutoff is not None else ''}")
         else:
-            success = run_paramsgen(args.names[0], args.rmsd_threshold, args.clean)
+            success = run_paramsgen(args.names[0], args.rmsd_threshold, args.clean, args.energy_cutoff)
             if not success:
                 print("ERROR: paramsgen stage failed")
                 return 1

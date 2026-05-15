@@ -18,17 +18,38 @@ Output:
 import os
 import argparse
 import re
+import json
 import numpy as np
 import shutil
 import random
 import subprocess
 import time
 import math
+import tempfile
 from rdkit.Chem import Lipinski
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, SDMolSupplier
 from rdkit.Chem.rdForceFieldHelpers import UFFGetMoleculeForceField
 from rdkit.Chem.rdMolTransforms import SetDihedralDeg
+
+# AIMNet imports are conditional (requires GPU/CUDA)
+AIMNET_AVAILABLE = False
+try:
+    import sys as _sys
+    _sys.path.append('/home/wendao/work/peprobe/aimnet/')
+    from aimnet import load_AIMNetMT_ens, load_AIMNetSMD_ens, AIMNetCalculator
+    import ase
+    import ase.optimize
+    from ase import Atoms
+    from ase.optimize import BFGS
+    from ase.constraints import FixInternals
+    import ase.io
+    AIMNET_AVAILABLE = True
+except ImportError:
+    pass
+
+# dftd4 availability flag
+DFTD4_AVAILABLE = shutil.which('dftd4') is not None
 
 
 # ============================================================================
@@ -688,6 +709,302 @@ def process_mol2_with_args(mol2_value, resp_folder='RESP'):
 
 
 # ============================================================================
+# AIMNet Optimization
+# ============================================================================
+
+def rdkit2ase(mol):
+    """Convert RDKit molecule to ASE Atoms object."""
+    AllChem.EmbedMolecule(mol)
+    conf = mol.GetConformer()
+    num_atoms = mol.GetNumAtoms()
+    coords = np.array([conf.GetAtomPosition(i) for i in range(num_atoms)])
+    symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
+    return Atoms(symbols=symbols, positions=coords)
+
+
+def get_dihedral_angle(conf, indices):
+    """Get dihedral angle for specified atom indices."""
+    from rdkit.Chem import rdMolTransforms
+    return rdMolTransforms.GetDihedralDeg(conf, *indices)
+
+
+def obabel_smiles_to_rdkit(smiles):
+    """Generate 3D conformer using obabel (more stable than RDKit for some cases)."""
+    with tempfile.NamedTemporaryFile(suffix=".sdf", delete=False) as tmp_sdf:
+        obabel_cmd = f'obabel -:"{smiles}" --gen3D -O {tmp_sdf.name}'
+        subprocess.run(obabel_cmd, shell=True, check=True)
+        suppl = SDMolSupplier(tmp_sdf.name)
+        mol = next(suppl)
+    return mol
+
+
+def save_rdkit_mol_to_pdb(mol, pdb_filename="temp.pdb"):
+    """Save RDKit molecule as temporary PDB file."""
+    pdb_dir = "pdb_files"
+    if not os.path.exists(pdb_dir):
+        os.makedirs(pdb_dir)
+
+    pdb_filepath = os.path.join(pdb_dir, pdb_filename)
+    mol = Chem.AddHs(mol)
+
+    if mol.GetNumConformers() == 0:
+        AllChem.EmbedMolecule(mol)
+
+    with open(pdb_filepath, 'w') as pdb_file:
+        pdb_file.write(Chem.rdmolfiles.MolToPDBBlock(mol))
+
+    print(f"Saved RDKit mol to {pdb_filepath}")
+
+
+def replace_pdb_lines(name):
+    """Replace AIMNet PDB atom names with RDKit naming for consistency."""
+    smd_pdb_file = f"smd_{name}.pdb"
+    temp_pdb_file = os.path.join("pdb_files", "temp.pdb")
+
+    if not os.path.exists(smd_pdb_file):
+        raise FileNotFoundError(f"File {smd_pdb_file} does not exist.")
+    if not os.path.exists(temp_pdb_file):
+        raise FileNotFoundError(f"File {temp_pdb_file} does not exist.")
+
+    with open(smd_pdb_file, 'r') as file:
+        list_A = [line for line in file if line.startswith("ATOM") or line.startswith("HETATM")]
+
+    with open(temp_pdb_file, 'r') as file:
+        list_B = [line for line in file if line.startswith("ATOM") or line.startswith("HETATM")]
+
+    if len(list_A) != len(list_B):
+        raise ValueError("The number of 'ATOM' or 'HETATM' lines in the files do not match.")
+
+    for i in range(len(list_B)):
+        list_B[i] = list_B[i][:17] + list_A[i][17:]
+
+    list_B.append("END\n")
+
+    with open(temp_pdb_file, 'w') as file:
+        file.writelines(list_B)
+
+    print(f"Updated {temp_pdb_file} with AIMNet atom names.")
+
+
+def optimize_molecule_aimnet(smiles, name):
+    """Optimize NCAA structure using AIMNet neural network (gas + solvent phases).
+
+    Returns path to the optimized PDB file.
+    """
+    if not AIMNET_AVAILABLE:
+        raise RuntimeError("AIMNet is not available. Ensure CUDA and aimnet package are installed.")
+
+    # Generate initial 3D structure with obabel
+    mol = obabel_smiles_to_rdkit(smiles)
+
+    # Build atom index map
+    atom_indices = {atom.GetSymbol() + str(i + 1): atom.GetIdx()
+                    for i, atom in enumerate(mol.GetAtoms())}
+
+    # Embed and save reference PDB
+    AllChem.EmbedMolecule(mol)
+    save_rdkit_mol_to_pdb(mol)
+
+    # Set backbone dihedrals before UFF pre-optimization
+    SetDihedralDeg(mol.GetConformer(), 1, 3, 4, 5, -150.0)
+    SetDihedralDeg(mol.GetConformer(), 3, 4, 5, 7, 150.0)
+    SetDihedralDeg(mol.GetConformer(), 2, 1, 3, 4, 4.18)
+    SetDihedralDeg(mol.GetConformer(), 6, 5, 7, 8, 1.17)
+
+    # UFF pre-optimization to avoid bad starting geometry
+    ff = UFFGetMoleculeForceField(mol)
+    ff.Initialize()
+    ff.Minimize()
+
+    # Re-set dihedrals after UFF
+    SetDihedralDeg(mol.GetConformer(), 1, 3, 4, 5, -150.0)
+    SetDihedralDeg(mol.GetConformer(), 3, 4, 5, 7, 150.0)
+    SetDihedralDeg(mol.GetConformer(), 2, 1, 3, 4, 4.18)
+    SetDihedralDeg(mol.GetConformer(), 6, 5, 7, 8, 1.17)
+
+    print(f"Dihedral after UFF: C2-N4-C5-C6={get_dihedral_angle(mol.GetConformer(), [1, 3, 4, 5]):.2f}")
+    print(f"Dihedral after UFF: N4-C5-C6-N8={get_dihedral_angle(mol.GetConformer(), [3, 4, 5, 7]):.2f}")
+
+    # Add hydrogens and convert to ASE
+    mol = Chem.AddHs(mol)
+    atoms = rdkit2ase(mol)
+
+    # Define backbone dihedral constraints
+    dihedrals_deg = [
+        [-150.0, [atom_indices['C2'], atom_indices['N4'], atom_indices['C5'], atom_indices['C6']]],
+        [150.0, [atom_indices['N4'], atom_indices['C5'], atom_indices['C6'], atom_indices['N8']]]
+    ]
+    constraints = FixInternals(dihedrals_deg=dihedrals_deg, epsilon=0.03)
+
+    # Load AIMNet models
+    model_gas = load_AIMNetMT_ens().cuda()
+    model_smd = load_AIMNetSMD_ens().cuda()
+    calc_gas = AIMNetCalculator(model_gas)
+    calc_smd = AIMNetCalculator(model_smd)
+
+    # Gas phase optimization
+    atoms.calc = calc_gas
+    opt = ase.optimize.BFGS(atoms, trajectory='gas_opt.traj')
+    opt.run(steps=50, fmax=0.001)
+
+    # Solvent phase optimization
+    atoms = rdkit2ase(mol)
+    atoms.calc = calc_smd
+    opt = ase.optimize.BFGS(atoms, trajectory='smd_opt.traj')
+    opt.run(steps=499, fmax=0.001)
+
+    # Convert trajectories to PDB
+    traj_files = {'gas': 'gas_opt.traj', 'smd': 'smd_opt.traj'}
+
+    for key, traj_file in traj_files.items():
+        pdb_file = f"{key}_{name}.pdb"
+        traj = ase.io.read(traj_file, index=-1)
+        ase.io.write(pdb_file, traj)
+
+        with open(pdb_file, 'r') as f:
+            pdb_lines = f.readlines()
+
+        with open(pdb_file, 'w') as f:
+            atom_count = 0
+            hydrogen_count = 0
+            for line in pdb_lines:
+                if line.startswith("HETATM") or line.startswith("ATOM"):
+                    atom_idx = int(line[6:11].strip()) - 1
+                    atom = mol.GetAtomWithIdx(atom_idx)
+                    atom_name = f"{atom.GetSymbol()}{atom.GetIdx() + 1}".ljust(4)
+                    line = line[:12] + atom_name + line[16:]
+
+                    atom_count += 1
+                    is_hydrogen = line[76:78].strip() == 'H'
+                    if is_hydrogen:
+                        hydrogen_count += 1
+
+                    if atom_count <= 3:
+                        line = line[:17] + "ACE" + line[20:]
+                    elif atom_count == 8 or atom_count == 9:
+                        line = line[:17] + "NME" + line[20:]
+                    elif is_hydrogen:
+                        if hydrogen_count <= 3:
+                            line = line[:17] + "ACE" + line[20:]
+                        elif 6 <= hydrogen_count <= 9:
+                            line = line[:17] + "NME" + line[20:]
+                        else:
+                            line = line[:17] + name + line[20:]
+                    else:
+                        line = line[:17] + name + line[20:]
+                f.write(line)
+
+    replace_pdb_lines(name)
+
+    return os.path.join("pdb_files", "temp.pdb")
+
+
+# ============================================================================
+# dftd4 Conformer Energy Calculation
+# ============================================================================
+
+def extract_energy_from_dftd4_output(out_filename):
+    """Extract dispersion energy from dftd4 output file."""
+    with open(out_filename, 'r') as out_file:
+        for line in out_file:
+            if "Dispersion energy:" in line:
+                parts = line.split()
+                if len(parts) >= 4:
+                    try:
+                        return float(parts[-2])
+                    except ValueError:
+                        print(f"Cannot convert '{parts[-2]}' to float")
+                        return None
+    print(f"No energy value found in '{out_filename}'")
+    return None
+
+
+def check_for_clashes(mol, threshold=0.6):
+    """Check for steric clashes in a conformer (atoms closer than threshold Angstrom)."""
+    conf = mol.GetConformer()
+    num_atoms = mol.GetNumAtoms()
+    for i in range(num_atoms):
+        pos_i = conf.GetAtomPosition(i)
+        for j in range(i + 1, num_atoms):
+            if pos_i.Distance(conf.GetAtomPosition(j)) < threshold:
+                return True
+    return False
+
+
+def gen_conformers_with_dftd4(processed_smiles_list, names_list, output_dir='pdb_files'):
+    """Generate conformers with dftd4 dispersion energy calculation."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    generated_files = []
+    for i, (smiles, name) in enumerate(zip(processed_smiles_list, names_list)):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Cannot parse SMILES: '{smiles}'")
+            continue
+
+        mol = Chem.AddHs(mol)
+        random_seed = random.randint(1, 1000000)
+        params = AllChem.ETKDG()
+        params.randomSeed = random_seed
+        AllChem.EmbedMolecule(mol, params)
+
+        # UFF optimization
+        ff = UFFGetMoleculeForceField(mol)
+        ff.Initialize()
+        ff.Minimize()
+
+        # Skip clashing conformers
+        if check_for_clashes(mol):
+            print(f"Conformer {name}_{i + 1} has steric clashes, skipping.")
+            continue
+
+        # Set backbone dihedrals
+        SetDihedralDeg(mol.GetConformer(), 1, 3, 4, 5, -150.0)
+        SetDihedralDeg(mol.GetConformer(), 3, 4, 5, 7, 150.0)
+        SetDihedralDeg(mol.GetConformer(), 2, 1, 3, 4, 4.18)
+        SetDihedralDeg(mol.GetConformer(), 6, 5, 7, 8, 1.17)
+
+        # Calculate dftd4 energy
+        energy = None
+        if DFTD4_AVAILABLE:
+            xyz_filename = os.path.join(output_dir, f'{name}_{i + 1}.xyz')
+            Chem.MolToXYZFile(mol, xyz_filename)
+            out_filename = os.path.join(output_dir, f'{name}_{i + 1}.out')
+            command = f'dftd4 {xyz_filename} -f b3-lyp > {out_filename}'
+            result = subprocess.run(command, shell=True, text=True, capture_output=True)
+            energy = extract_energy_from_dftd4_output(out_filename)
+
+        # Generate PDB with energy in REMARK
+        pdb_filename = os.path.join(output_dir, f'{name}_{i + 1}.pdb')
+        with open(pdb_filename, 'w') as pdb_file:
+            pdb_file.write(f"REMARK SMILES: {smiles}\n")
+            if energy is not None:
+                pdb_file.write(f"REMARK Energy after optimization: {energy * 627.5095:.2f} kcal/mol\n")
+            else:
+                pdb_file.write("REMARK Energy could not be determined\n")
+            pdb_file.write(Chem.rdmolfiles.MolToPDBBlock(mol))
+
+        generated_files.append(pdb_filename)
+
+    return generated_files
+
+
+# ============================================================================
+# Pipeline State File
+# ============================================================================
+
+STATE_FILE = '.prepff_state.json'
+
+
+def save_pipeline_state(state_dict):
+    """Save pipeline state to JSON file for subsequent stages to read."""
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state_dict, f, indent=2)
+    print(f"Pipeline state saved to {STATE_FILE}")
+
+
+# ============================================================================
 # Main Pipeline
 # ============================================================================
 
@@ -697,10 +1014,12 @@ def main(input_file, names_list, cut_off, optimization_method='gaussian'):
 
     # Step 1: Analyze rotatable bonds
     results = count_rotatable_bonds(input_file, cut_off)
-    for smiles, num_rotatable_bonds, c_val, v_val in results:
-        print(f"SMILES: {smiles}  Rotatable bonds: {num_rotatable_bonds}  "
+    num_rotatable_bonds = 0
+    for smiles, num_rot, c_val, v_val in results:
+        print(f"SMILES: {smiles}  Rotatable bonds: {num_rot}  "
               f"c_value: {c_val}  v_value: {v_val}")
         c_value, v_value = c_val, v_val
+        num_rotatable_bonds = num_rot
 
     n_value = names_list[0]
     combined_file = 'combined_pdb_files.pdb'
@@ -709,14 +1028,22 @@ def main(input_file, names_list, cut_off, optimization_method='gaussian'):
     print("\n=== Generating conformers ===")
     processed_smiles_list = gen_smiles(input_file, names_list)
 
-    for i in range(c_value):
-        print(f"Running iteration {i + 1}...")
-        gen_conformers(processed_smiles_list, names_list)
-
-        for pdb_file in os.listdir('pdb_files'):
-            if pdb_file.endswith('.pdb'):
-                pdb_filepath = os.path.join('pdb_files', pdb_file)
-                append_pdb_to_combined_file(pdb_filepath, combined_file)
+    if DFTD4_AVAILABLE:
+        print("Using dftd4 for conformer energy calculation.")
+        for i in range(c_value):
+            print(f"Running iteration {i + 1}...")
+            gen_conformers_with_dftd4(processed_smiles_list, names_list)
+            for pdb_file in os.listdir('pdb_files'):
+                if pdb_file.endswith('.pdb'):
+                    append_pdb_to_combined_file(pdb_file, combined_file)
+    else:
+        for i in range(c_value):
+            print(f"Running iteration {i + 1}...")
+            gen_conformers(processed_smiles_list, names_list)
+            for pdb_file in os.listdir('pdb_files'):
+                if pdb_file.endswith('.pdb'):
+                    pdb_filepath = os.path.join('pdb_files', pdb_file)
+                    append_pdb_to_combined_file(pdb_filepath, combined_file)
 
     # Step 3: Split and sort PDB files
     print("\n=== Processing PDB files ===")
@@ -772,8 +1099,54 @@ def main(input_file, names_list, cut_off, optimization_method='gaussian'):
             pdb_filepath = os.path.join(output_pdb_dir, pdb_file)
             remove_conect_lines_from_pdb(pdb_filepath)
 
-    # Step 9: Generate Gaussian input
+    # Step 9: Optimization
+    if optimization_method == 'aimnet':
+        # --- AIMNet path ---
+        if not AIMNET_AVAILABLE:
+            print("ERROR: AIMNet is not available. Install aimnet and ensure CUDA is configured.")
+            print("Falling back to Gaussian...")
+            optimization_method = 'gaussian'
+        else:
+            print("\n=== Running AIMNet optimization ===")
+            capped_smiles = processed_smiles_list[0]
+            aimnet_pdb = optimize_molecule_aimnet(capped_smiles, n_value)
+            print(f"AIMNet optimization complete: {aimnet_pdb}")
+
+            # Convert AIMNet output to MOL
+            if not os.path.exists('mol'):
+                os.makedirs('mol')
+            mol_output = os.path.join('mol', f'{n_value}_1_opt.mol')
+            os.system(f'obabel {aimnet_pdb} -O {mol_output}')
+            # Also copy as the canonical name
+            shutil.copy(mol_output, os.path.join('mol', f'{n_value}_opt.mol'))
+
+            # Add polymer info
+            with open(input_file, 'r') as f:
+                raw_smiles = f.read().strip()
+            chirality = 'L' if '[C@@H]' in raw_smiles else ('D' if '[C@H]' in raw_smiles else 'L')
+            add_polymer_info(os.path.join('mol', f'{n_value}_opt.mol'), chirality)
+
+            # Generate MOL2 with Gasteiger charges (no RESP for AIMNet)
+            if not os.path.exists(resp_folder):
+                os.makedirs(resp_folder)
+            mol2_output = os.path.join(resp_folder, f'{n_value}_1.mol2')
+            os.system(f'antechamber -i {aimnet_pdb} -fi pdb -o {mol2_output} -fo mol2 -at amber -c gas')
+            print(f"Generated MOL2 with Gasteiger charges: {mol2_output}")
+
+            # Create a dummy log file so process_log_files doesn't fail
+            # (atom_type_adjust needs params file to exist first)
+            # params files will be generated by paramsgen, so skip atom_type_adjust here
+            # but still do cap charge calculation if the params files happen to exist
+            if os.path.exists(f'{n_value}_temps.params'):
+                atom_type_adjust(resp_folder)
+                calculate_capcharge(resp_folder)
+            else:
+                print("Note: params files not yet generated. Run paramsgen to complete.")
+
+            process_mol2_with_args(n_value, resp_folder)
+
     if optimization_method == 'gaussian':
+        # --- Gaussian path ---
         print("\n=== Running Gaussian optimization ===")
         gaussian_input_dir = 'GJF'
         generate_gaussian_input(adjusted_pdb_files, gaussian_input_dir, system_charge)
@@ -792,30 +1165,41 @@ def main(input_file, names_list, cut_off, optimization_method='gaussian'):
             if not all_jobs_completed:
                 time.sleep(60)
 
-    # Step 10: Process log files and generate MOL
-    print("\n=== Generating MOL files ===")
-    process_log_files(input_file, gjf_folder)
+        # Process log files and generate MOL
+        print("\n=== Generating MOL files ===")
+        process_log_files(input_file, gjf_folder)
 
-    # Step 11: Generate RESP files
-    print("\n=== Running RESP charge calculation ===")
-    if not os.path.exists(resp_folder):
-        os.makedirs(resp_folder)
+        # Generate RESP files
+        print("\n=== Running RESP charge calculation ===")
+        if not os.path.exists(resp_folder):
+            os.makedirs(resp_folder)
 
-    for filename in os.listdir(gjf_folder):
-        if filename.endswith('.log'):
-            res = os.path.splitext(filename)[0]
-            resp = os.path.join(resp_folder, res)
+        for filename in os.listdir(gjf_folder):
+            if filename.endswith('.log'):
+                res = os.path.splitext(filename)[0]
+                resp = os.path.join(resp_folder, res)
 
-            shutil.copyfile(os.path.join(gjf_folder, filename), f'{res}.log')
-            generate_resp_input(res, resp)
-            run_resp_calculation(res, resp)
-            shutil.move(f'{res}.log', os.path.join(resp_folder, f'{res}.log'))
+                shutil.copyfile(os.path.join(gjf_folder, filename), f'{res}.log')
+                generate_resp_input(res, resp)
+                run_resp_calculation(res, resp)
+                shutil.move(f'{res}.log', os.path.join(resp_folder, f'{res}.log'))
 
-    # Step 12: Adjust atom types and cap charges
-    print("\n=== Finalizing MOL2 files ===")
-    atom_type_adjust(resp_folder)
-    calculate_capcharge(resp_folder)
-    process_mol2_with_args(n_value, resp_folder)
+        # Adjust atom types and cap charges
+        print("\n=== Finalizing MOL2 files ===")
+        atom_type_adjust(resp_folder)
+        calculate_capcharge(resp_folder)
+        process_mol2_with_args(n_value, resp_folder)
+
+    # Save pipeline state for subsequent stages
+    save_pipeline_state({
+        'v_value': v_value,
+        'c_value': c_value,
+        'n_value': n_value,
+        'names': names_list,
+        'optimization_method': optimization_method,
+        'num_rotatable_bonds': num_rotatable_bonds,
+        'rmsd_thresholds': RMSD_THRESHOLDS
+    })
 
     print("\n=== prepff completed successfully ===")
     print(f"Output files:")
